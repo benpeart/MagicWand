@@ -1,0 +1,41 @@
+type: vertical-stack
+cards:
+  - type: entities
+    title: Magic Wand
+    show_header_toggle: false
+    entities:
+      - entity: sensor.wand_last_gesture
+        name: Last Gesture
+        icon: mdi:gesture-double-tap
+      - entity: sensor.wand_battery
+        name: Battery Level
+        icon: mdi:battery
+      - entity: sensor.wand_rssi
+        name: WiFi Signal
+        icon: mdi:wifi
+
+  - type: history-graph
+    title: Gesture History
+    hours_to_show: 6
+    entities:
+      - entity: sensor.wand_last_gesture
+
+  - type: gauge
+    entity: sensor.wand_battery
+    name: Battery
+    min: 0
+    max: 100
+    severity:
+      green: 50
+      yellow: 25
+      red: 10
+
+  - type: gauge
+    entity: sensor.wand_rssi
+    name: WiFi RSSI
+    min: -100
+    max: -30
+    severity:
+      green: -60
+      yellow: -75
+      red: -90
