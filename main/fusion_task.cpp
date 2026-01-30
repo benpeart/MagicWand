@@ -14,7 +14,7 @@
 static const char *TAG = "fusion_task";
 #define FUSION_TASK_CORE 1
 #define FUSION_TASK_PRIORITY 5
-#define FUSION_TASK_STACK (10 * 1024)
+#define FUSION_TASK_STACK (16 * 1024)
 
 // Use nominal IMU rate only as a fallback
 #define DT_FALLBACK_SEC (1.0f / IMU_RATE_HZ)
@@ -49,14 +49,14 @@ static float vel_x = 0.0f, vel_y = 0.0f, vel_z = 0.0f;
 // Gravity estimate in world frame
 static float g_est_x = 0.0f;
 static float g_est_y = 0.0f;
-static float g_est_z = G; // start with nominal gravity
+static float g_est_z = 9.80665f; // start with nominal gravity
 
 // Gesture segmentation state
 static bool gesture_active = false;
 static uint64_t gesture_start_ts = 0;
 static uint64_t last_motion_ts = 0;
 
-static GestureSample gesture_buf[WINDOW_SIZE];
+static GestureSample gesture_buf[MAX_RAW_GESTURE_SAMPLES];
 static int gesture_len = 0;
 
 // -----------------------------
@@ -155,34 +155,54 @@ static void madgwick_update(float gx, float gy, float gz,
 }
 
 // -----------------------------
-// Normalize gesture (center, scale, resample)
+// Normalize gesture (resample, center, scale)
 // -----------------------------
 static int normalize_gesture(const GestureSample *in, int count, GestureSample *out)
 {
-    // ===== CENTERING =====
-    float cx = 0.0f, cy = 0.0f;
-    for (int i = 0; i < count; i++)
-    {
-        cx += in[i].x;
-        cy += in[i].y;
-    }
-    cx /= count;
-    cy /= count;
+    // ===== RESAMPLING (on raw data) =====
+    // Proper linear resampling across full range
+    float resampled_x[INFERENCE_WINDOW_SIZE];
+    float resampled_y[INFERENCE_WINDOW_SIZE];
 
-    // ===== SCALING =====
+    for (int i = 0; i < INFERENCE_WINDOW_SIZE; i++)
+    {
+        float t = (float)i / (INFERENCE_WINDOW_SIZE - 1);
+        float src_f = t * (count - 1);
+        int idx0 = (int)src_f;
+        int idx1 = idx0 + 1;
+        if (idx1 >= count)
+            idx1 = count - 1;
+
+        float alpha = src_f - idx0;
+
+        resampled_x[i] = in[idx0].x * (1 - alpha) + in[idx1].x * alpha;
+        resampled_y[i] = in[idx0].y * (1 - alpha) + in[idx1].y * alpha;
+    }
+
+    // ===== CENTERING (on resampled data) =====
+    float cx = 0.0f, cy = 0.0f;
+    for (int i = 0; i < INFERENCE_WINDOW_SIZE; i++)
+    {
+        cx += resampled_x[i];
+        cy += resampled_y[i];
+    }
+    cx /= INFERENCE_WINDOW_SIZE;
+    cy /= INFERENCE_WINDOW_SIZE;
+
+    // ===== SCALING (on centered, resampled data) =====
     // Normalize to unit circle
     float max_r = 0.0f;
-    float centered_x[WINDOW_SIZE];
-    float centered_y[WINDOW_SIZE];
+    float centered_x[INFERENCE_WINDOW_SIZE];
+    float centered_y[INFERENCE_WINDOW_SIZE];
 #ifdef DEBUG
     float min_cx = 1e6f, max_cx = -1e6f;
     float min_cy = 1e6f, max_cy = -1e6f;
 #endif // DEBUG
 
-    for (int i = 0; i < count; i++)
+    for (int i = 0; i < INFERENCE_WINDOW_SIZE; i++)
     {
-        float x = in[i].x - cx;
-        float y = in[i].y - cy;
+        float x = resampled_x[i] - cx;
+        float y = resampled_y[i] - cy;
         centered_x[i] = x;
         centered_y[i] = y;
 
@@ -203,7 +223,7 @@ static int normalize_gesture(const GestureSample *in, int count, GestureSample *
     }
 
 #ifdef DEBUG
-    ESP_LOGI(TAG, "normalize_gesture: count=%d, centroid=(%.6f, %.6f)", count, cx, cy);
+    ESP_LOGI(TAG, "normalize_gesture: count=%d->%d, centroid=(%.6f, %.6f)", count, INFERENCE_WINDOW_SIZE, cx, cy);
     ESP_LOGI(TAG, "  centered ranges: x=[%.6f, %.6f], y=[%.6f, %.6f], max_r=%.6f",
              min_cx, max_cx, min_cy, max_cy, max_r);
 #endif // DEBUG
@@ -211,31 +231,22 @@ static int normalize_gesture(const GestureSample *in, int count, GestureSample *
     if (max_r < 1e-6f)
         max_r = 1e-6f;
 
-    for (int i = 0; i < count; i++)
+    for (int i = 0; i < INFERENCE_WINDOW_SIZE; i++)
     {
         centered_x[i] /= max_r;
         centered_y[i] /= max_r;
     }
 
-    // ===== RESAMPLING =====
-    // Proper linear resampling across full range
-    for (int i = 0; i < WINDOW_SIZE; i++)
+    // ===== OUTPUT =====
+    // Populate output buffer with normalized, resampled data
+    for (int i = 0; i < INFERENCE_WINDOW_SIZE; i++)
     {
-        float t = (float)i / (WINDOW_SIZE - 1);
-        float src_f = t * (count - 1);
-        int idx0 = (int)src_f;
-        int idx1 = idx0 + 1;
-        if (idx1 >= count)
-            idx1 = count - 1;
-
-        float alpha = src_f - idx0;
-
-        out[i].timestamp_us = in[idx0].timestamp_us;
-        out[i].x = centered_x[idx0] * (1 - alpha) + centered_x[idx1] * alpha;
-        out[i].y = centered_y[idx0] * (1 - alpha) + centered_y[idx1] * alpha;
+        out[i].timestamp_us = in[0].timestamp_us;  // Use first timestamp as reference
+        out[i].x = centered_x[i];
+        out[i].y = centered_y[i];
     }
 
-    return WINDOW_SIZE;
+    return INFERENCE_WINDOW_SIZE;
 }
 
 // -----------------------------
@@ -299,7 +310,7 @@ static void fusion_task(void *arg)
             fabsf(raw.gx) > MOVE_GYRO_THRESH ||
             fabsf(raw.gy) > MOVE_GYRO_THRESH ||
             fabsf(raw.gz) > MOVE_GYRO_THRESH;
-
+#ifdef DEBUG
         static int counter = 0;
         if (++counter % 50 == 0)
         {
@@ -309,7 +320,7 @@ static void fusion_task(void *arg)
                      still ? "true" : "false", moving ? "true" : "false",
                      raw.timestamp_us, ax, ay, az, raw.gx, raw.gy, raw.gz);
         }
-
+#endif // DEBUG
         if (moving)
         {
             last_motion_ts = now;
@@ -360,9 +371,13 @@ static void fusion_task(void *arg)
 
         if (gesture_active)
         {
-            if (gesture_len < WINDOW_SIZE)
+            if (gesture_len < sizeof(gesture_buf) / sizeof(gesture_buf[0]))
             {
                 gesture_buf[gesture_len++] = out;
+            }
+            else
+            {
+                ESP_LOGW(TAG, "Raw gesture buffer overflow — gesture truncated at %d samples", gesture_len);
             }
 
             uint32_t still_ms = (uint32_t)((now - last_motion_ts) / 1000);
@@ -374,12 +389,23 @@ static void fusion_task(void *arg)
             {
                 if (gesture_ms >= MIN_GESTURE_MS && gesture_len >= 32)
                 {
-                    GestureSample norm[WINDOW_SIZE];
+                    GestureSample norm[INFERENCE_WINDOW_SIZE];
                     int n = normalize_gesture(gesture_buf, gesture_len, norm);
 
+                    // Send start-of-gesture marker
+                    GestureSample marker = {
+                        .timestamp_us = 0,
+                        .x = NAN,
+                        .y = NAN};
+                    xQueueSend(g_fusion_queue, &marker, 0);
+
+                    // Send normalized gesture samples
                     for (int i = 0; i < n; i++)
                     {
-                        xQueueSend(g_fusion_queue, &norm[i], 0);
+                        if (xQueueSend(g_fusion_queue, &norm[i], 0) != pdTRUE)
+                        {
+                            ESP_LOGW(TAG, "fusion_queue full, dropping sample %d of %d", i, n);
+                        }
                     }
                     ESP_LOGI(TAG, "Gesture captured: %d samples, %d ms%s",
                              gesture_len, gesture_ms,

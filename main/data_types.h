@@ -1,13 +1,14 @@
 #pragma once
 #include <stdint.h>
 
+//#define DEBUG
 #define ENABLE_DATA_CAPTURE
 
-// -----------------------------
-// Configuration
-// -----------------------------
-#define G 9.80665f
-#define WINDOW_SIZE 256
+// Normalized gesture size (fixed for inference)
+#define INFERENCE_WINDOW_SIZE 256
+
+// Raw gesture capture buffer size (200 Hz * 3 sec = 600 samples) 
+#define MAX_RAW_GESTURE_SAMPLES 640
 
 // 200 Hz sampling
 #define IMU_RATE_HZ 200

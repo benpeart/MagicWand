@@ -9,7 +9,7 @@ void queues_init(void)
 {
     // Tune depths as needed
     g_imu_queue = xQueueCreate(64, sizeof(RawImuSample));
-    g_fusion_queue = xQueueCreate(64, sizeof(GestureSample));
+    g_fusion_queue = xQueueCreate(INFERENCE_WINDOW_SIZE + 1, sizeof(GestureSample));  // ensure enough room for one full gesture + marker
     g_gesture_queue = xQueueCreate(16, sizeof(GestureEvent));
 
     // Optionally assert

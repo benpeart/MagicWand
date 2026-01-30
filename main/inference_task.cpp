@@ -60,10 +60,10 @@ static void tflm_init(void)
     input_tensor = interpreter->input(0);
 
     configASSERT(input_tensor->dims->size == 3);
-    configASSERT(input_tensor->dims->data[1] == WINDOW_SIZE);
+    configASSERT(input_tensor->dims->data[1] == INFERENCE_WINDOW_SIZE);
     configASSERT(input_tensor->dims->data[2] == FEATURE_COUNT);
 
-    ESP_LOGI(TAG, "TFLM ready: input [%d x %d]", WINDOW_SIZE, FEATURE_COUNT);
+    ESP_LOGI(TAG, "TFLM ready: input [%d x %d]", INFERENCE_WINDOW_SIZE, FEATURE_COUNT);
 }
 
 // ---------------------------------------------------------
@@ -103,7 +103,7 @@ static GestureType decode_output(float *out_confidence)
 // ---------------------------------------------------------
 static void inference_task(void *arg)
 {
-    GestureSample gesture[WINDOW_SIZE];
+    GestureSample gesture[INFERENCE_WINDOW_SIZE];
     int count = 0;
 
     ESP_LOGI(TAG, "Entering inference_task");
@@ -112,13 +112,13 @@ static void inference_task(void *arg)
 
     for (;;)
     {
-        // Wait for first sample of a segmented gesture
+        // Wait for start of gesture marker indicating a new segmented gesture
         if (xQueueReceive(g_fusion_queue, &gesture[0], portMAX_DELAY) != pdTRUE)
             continue;
-        count = 1;
+        count = 0;
 
-        // Collect the rest of the gesture
-        while (count < WINDOW_SIZE)
+        // Now collect the gesture
+        while (count < INFERENCE_WINDOW_SIZE)
         {
             if (xQueueReceive(g_fusion_queue, &gesture[count], 0) != pdTRUE)
                 break;
