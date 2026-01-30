@@ -30,7 +30,6 @@ static void capture_task(void *arg)
     {
         if (xQueueReceive(g_fusion_queue, &g, portMAX_DELAY) == pdTRUE)
         {
-//            ESP_LOGI(TAG, "xQueueReceive: %" PRIu64 ",%f,%f", g.timestamp_us, g.x, g.y);
             printf("%" PRIu64 ",%f,%f\n", g.timestamp_us, g.x, g.y);
         }
     }

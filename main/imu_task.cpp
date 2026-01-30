@@ -99,7 +99,7 @@ static void imu_task(void *arg)
         sample.gy = raw_rot.y * gyro_scale;
         sample.gz = raw_rot.z * gyro_scale;
 
-//        ESP_LOGI(TAG, "xQueueSend: %" PRIu64 ",%f,%f", sample.timestamp_us, sample.ax, sample.ay);
+        // ESP_LOGI(TAG, "xQueueSend: %" PRIu64 ",%f,%f,%f,%f,%f,%f", sample.timestamp_us, sample.ax, sample.ay, sample.az, sample.gx, sample.gy, sample.gz);
         xQueueSend(g_imu_queue, &sample, 0);
 
         next_ts += IMU_PERIOD_US;

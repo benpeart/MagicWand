@@ -125,12 +125,20 @@ def main():
 
     ax.set_title("Real-time Wand Tip Trajectory")
     ax.set_xlabel("tip_x (world)")
-    ax.set_ylabel("tip_y (world)")
+    ax.set_ylabel("tip_z (world)")
     ax.set_aspect("equal", "box")
     ax.grid(True)
 
     def init():
         line.set_data([], [])
+        
+        # Always show unit-circle axes
+        ax.set_xlim(-1, 1)
+        ax.set_ylim(-1, 1)
+        ax.set_xticks([-1, 0, 1])
+        ax.set_yticks([-1, 0, 1])
+        ax.set_autoscale_on(False)
+        
         return line,
 
     def update(frame):
@@ -152,20 +160,9 @@ def main():
         ys = [p[2] for p in buffer]
         line.set_data(xs, ys)
 
-        if xs and ys:
-            margin = 0.05
-            xmin, xmax = min(xs), max(xs)
-            ymin, ymax = min(ys), max(ys)
-            dx = xmax - xmin
-            dy = ymax - ymin
-            if dx == 0: dx = 1e-3
-            if dy == 0: dy = 1e-3
-            ax.set_xlim(xmin - margin * dx, xmax + margin * dx)
-            ax.set_ylim(ymin - margin * dy, ymax + margin * dy)
-
         return line,
 
-    ani = FuncAnimation(fig, update, init_func=init, interval=30, blit=True, cache_frame_data=False)
+    ani = FuncAnimation(fig, update, init_func=init, interval=30, blit=False, cache_frame_data=False)
 
     try:
         plt.show()

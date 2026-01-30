@@ -1,37 +1,29 @@
-# Copyright 2020 The TensorFlow Authors. All Rights Reserved.
 #
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
+# Settings for the Hosyond ESP32-S3 Development Board N16R8 MCU
+# https://www.amazon.com/dp/B0F5QCK6X5?th=1
 #
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 #
 # CPU & Performance
 #
-CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ=240
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
 CONFIG_COMPILER_OPTIMIZATION_PERF=y
 
 #
 # Flash (ESP-1-N16R8 module)
-    #
+#
 CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
 CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
 CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
 
 #
-# PSRAM (8MB QSPI)
+# PSRAM (Integrated PSRAM on S3 uses octal (OPI) mode)
 #
-CONFIG_SPIRAM=n
-CONFIG_SPIRAM_MODE_QUAD=y
-CONFIG_SPIRAM_SPEED_80M=y
-CONFIG_SPIRAM_USE_MALLOC=y
+CONFIG_SPIRAM=y                 # Enable PSRAM
+CONFIG_SPIRAM_MODE_OCT=y        # Use octal PSRAM mode (embedded)
+CONFIG_SPIRAM_SPEED_80M=y       # PSRAM speed (80 MHz is safe; 120 MHz does not work)
+CONFIG_SPIRAM_TYPE_AUTO=y       # Let IDF auto‑detect the PSRAM type
+CONFIG_SPIRAM_USE_MALLOC=y      # Use PSRAM as heap
 
 #
 # Power Management
@@ -43,7 +35,6 @@ CONFIG_FREERTOS_USE_TICKLESS_IDLE=y
 #
 # I2C / IMU stability
 #
-CONFIG_I2C_ENABLE_LEGACY_DRIVER=y   # needed for MPU6050
 CONFIG_I2CDEV_USE_LEGACY_DRIVER=y   # needed for MPU6050
 CONFIG_I2C_ISR_IRAM_SAFE=y
 
@@ -55,12 +46,11 @@ CONFIG_ESP_TASK_WDT_INIT=y
 CONFIG_ESP_TASK_WDT_TIMEOUT_S=8
 
 # FreeRTOS stack overflow detection
-CONFIG_FREERTOS_CHECK_STACKOVERFLOW=y
 CONFIG_FREERTOS_CHECK_STACKOVERFLOW_CANARY=y
-CONFIG_FREERTOS_ENABLE_STACK_OVERFLOW_HOOK=y
 
 #
 # Logging
 #
+CONFIG_ESP_CONSOLE_UART_BAUDRATE=921600
 CONFIG_LOG_DEFAULT_LEVEL_INFO=y
 CONFIG_LOG_COLORS=y
