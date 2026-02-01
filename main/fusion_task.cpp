@@ -36,7 +36,7 @@ static const char *TAG = "fusion_task";
 
 // Gesture segmentation timing
 #define STILLNESS_END_MS 300 // end gesture after 300ms stillness
-#define MIN_GESTURE_MS 150   // reject gestures shorter than 150ms
+#define MIN_GESTURE_MS 750   // reject gestures shorter than 750ms
 #define MAX_GESTURE_MS 3000  // hard cap at 3s
 
 // Madgwick quaternion state
@@ -159,99 +159,147 @@ static void madgwick_update(float gx, float gy, float gz,
 // -----------------------------
 static int normalize_gesture(const GestureSample *in, int count, GestureSample *out)
 {
-    // ===== RESAMPLING (on raw data) =====
-    // Proper linear resampling across full range
-    float resampled_x[INFERENCE_WINDOW_SIZE];
-    float resampled_y[INFERENCE_WINDOW_SIZE];
+    // --------------------------------------------------------
+    // 0. Degenerate gesture check
+    // --------------------------------------------------------
+    if (count < 2)
+    {
+        for (int i = 0; i < INFERENCE_WINDOW_SIZE; i++)
+        {
+            out[i].timestamp_us = in[0].timestamp_us;
+            out[i].x = 0.0f;
+            out[i].y = 0.0f;
+        }
+        return INFERENCE_WINDOW_SIZE;
+    }
+
+    // --------------------------------------------------------
+    // 1. Compute cumulative arc-length
+    // --------------------------------------------------------
+    float dist[count];
+    dist[0] = 0.0f;
+
+    for (int i = 1; i < count; i++)
+    {
+        float dx = in[i].x - in[i - 1].x;
+        float dy = in[i].y - in[i - 1].y;
+        float d = sqrtf(dx * dx + dy * dy);
+        dist[i] = dist[i - 1] + d;
+    }
+
+    // --------------------------------------------------------
+    // 2. Enforce strict monotonicity (critical!)
+    // --------------------------------------------------------
+    for (int i = 1; i < count; i++)
+    {
+        if (dist[i] < dist[i - 1])
+        {
+            dist[i] = dist[i - 1];
+        }
+    }
+
+    float total_len = dist[count - 1];
+
+    // If gesture is basically a point
+    if (total_len < 1e-6f)
+    {
+        for (int i = 0; i < INFERENCE_WINDOW_SIZE; i++)
+        {
+            out[i].timestamp_us = in[0].timestamp_us;
+            out[i].x = 0.0f;
+            out[i].y = 0.0f;
+        }
+        return INFERENCE_WINDOW_SIZE;
+    }
+
+    // --------------------------------------------------------
+    // 3. Arc-length resampling
+    // --------------------------------------------------------
+    float step = total_len / (INFERENCE_WINDOW_SIZE - 1);
+    float target = 0.0f;
+
+    float rx[INFERENCE_WINDOW_SIZE], ry[INFERENCE_WINDOW_SIZE];
+    int src = 0;
 
     for (int i = 0; i < INFERENCE_WINDOW_SIZE; i++)
     {
-        float t = (float)i / (INFERENCE_WINDOW_SIZE - 1);
-        float src_f = t * (count - 1);
-        int idx0 = (int)src_f;
-        int idx1 = idx0 + 1;
-        if (idx1 >= count)
-            idx1 = count - 1;
 
-        float alpha = src_f - idx0;
+        while (src < count - 2 && dist[src + 1] < target)
+        {
+            src++;
+        }
 
-        resampled_x[i] = in[idx0].x * (1 - alpha) + in[idx1].x * alpha;
-        resampled_y[i] = in[idx0].y * (1 - alpha) + in[idx1].y * alpha;
+        float d0 = dist[src];
+        float d1 = dist[src + 1];
+        float span = d1 - d0;
+
+        float alpha = 0.0f;
+        if (span > 1e-6f)
+        {
+            alpha = (target - d0) / span;
+        }
+
+        float x0 = in[src].x;
+        float y0 = in[src].y;
+        float x1 = in[src + 1].x;
+        float y1 = in[src + 1].y;
+
+        rx[i] = x0 + alpha * (x1 - x0);
+        ry[i] = y0 + alpha * (y1 - y0);
+
+        target += step;
     }
 
-    // ===== CENTERING (on resampled data) =====
+    // --------------------------------------------------------
+    // 4. Centering
+    // --------------------------------------------------------
     float cx = 0.0f, cy = 0.0f;
     for (int i = 0; i < INFERENCE_WINDOW_SIZE; i++)
     {
-        cx += resampled_x[i];
-        cy += resampled_y[i];
+        cx += rx[i];
+        cy += ry[i];
     }
     cx /= INFERENCE_WINDOW_SIZE;
     cy /= INFERENCE_WINDOW_SIZE;
 
-    // ===== SCALING (on centered, resampled data) =====
-    // Normalize to unit circle
+    // --------------------------------------------------------
+    // 5. Unit-circle scaling
+    // --------------------------------------------------------
     float max_r = 0.0f;
-    float centered_x[INFERENCE_WINDOW_SIZE];
-    float centered_y[INFERENCE_WINDOW_SIZE];
-#ifdef DEBUG
-    float min_cx = 1e6f, max_cx = -1e6f;
-    float min_cy = 1e6f, max_cy = -1e6f;
-#endif // DEBUG
-
     for (int i = 0; i < INFERENCE_WINDOW_SIZE; i++)
     {
-        float x = resampled_x[i] - cx;
-        float y = resampled_y[i] - cy;
-        centered_x[i] = x;
-        centered_y[i] = y;
-
-#ifdef DEBUG
-        if (x < min_cx)
-            min_cx = x;
-        if (x > max_cx)
-            max_cx = x;
-        if (y < min_cy)
-            min_cy = y;
-        if (y > max_cy)
-            max_cy = y;
-#endif // DEBUG
-
+        float x = rx[i] - cx;
+        float y = ry[i] - cy;
         float r = sqrtf(x * x + y * y);
         if (r > max_r)
             max_r = r;
     }
 
-#ifdef DEBUG
-    ESP_LOGI(TAG, "normalize_gesture: count=%d->%d, centroid=(%.6f, %.6f)", count, INFERENCE_WINDOW_SIZE, cx, cy);
-    ESP_LOGI(TAG, "  centered ranges: x=[%.6f, %.6f], y=[%.6f, %.6f], max_r=%.6f",
-             min_cx, max_cx, min_cy, max_cy, max_r);
-#endif // DEBUG
-
     if (max_r < 1e-6f)
         max_r = 1e-6f;
 
+    // --------------------------------------------------------
+    // 6. Output
+    // --------------------------------------------------------
+    uint32_t ts = in[0].timestamp_us;
     for (int i = 0; i < INFERENCE_WINDOW_SIZE; i++)
     {
-        centered_x[i] /= max_r;
-        centered_y[i] /= max_r;
+        out[i].timestamp_us = ts;
+        out[i].x = (rx[i] - cx) / max_r;
+        out[i].y = (ry[i] - cy) / max_r;
     }
 
-    // ===== OUTPUT =====
-    // Populate output buffer with normalized, resampled data
-    for (int i = 0; i < INFERENCE_WINDOW_SIZE; i++)
-    {
-        out[i].timestamp_us = in[0].timestamp_us;  // Use first timestamp as reference
-        out[i].x = centered_x[i];
-        out[i].y = centered_y[i];
-    }
+#ifdef DEBUG
+    ESP_LOGI(TAG, "normalize_gesture: raw=%d, out=%d, total_len=%.6f, centroid=(%.6f, %.6f)",
+             count, INFERENCE_WINDOW_SIZE, total_len, cx, cy);
+#endif
 
     return INFERENCE_WINDOW_SIZE;
 }
 
-// -----------------------------
-// Main fusion + segmentation task
-// -----------------------------
+// ---------------------------------------------
+// Main fusion, segmentation, normalization task
+// ---------------------------------------------
 static void fusion_task(void *arg)
 {
     RawImuSample raw;
@@ -335,9 +383,9 @@ static void fusion_task(void *arg)
         }
 
         // Integrate acceleration → velocity → position
-        if (still)
+        if (still && !gesture_active)
         {
-            // Aggressive reset when still: forget history
+            // Aggressive reset when still: forget history (but NOT during gesture)
             vel_x = vel_y = vel_z = 0.0f;
             pos_x = pos_y = pos_z = 0.0f;
         }
@@ -387,10 +435,25 @@ static void fusion_task(void *arg)
 
             if (still_ms > STILLNESS_END_MS || time_exceeded)
             {
-                if (gesture_ms >= MIN_GESTURE_MS && gesture_len >= 32)
+                if (gesture_ms >= MIN_GESTURE_MS)
                 {
+#if 1
+                    ESP_LOGI(TAG, "Pre normalized count[%d]\n", gesture_len);
+                    for (int i = 0; i < gesture_len; i++)
+                    {
+                        printf("%" PRIu64 ",%f,%f\n", gesture_buf[i].timestamp_us, gesture_buf[i].x, gesture_buf[i].y);
+                    }
+#endif
+                    // normalize the gesture samples
                     GestureSample norm[INFERENCE_WINDOW_SIZE];
                     int n = normalize_gesture(gesture_buf, gesture_len, norm);
+#if 1
+                    ESP_LOGI(TAG, "Normalized count[%d]\n", n);
+                    for (int i = 0; i < n; i++)
+                    {
+                        printf("%" PRIu64 ",%f,%f\n", norm[i].timestamp_us, norm[i].x, norm[i].y);
+                    }
+#endif // DEBUG
 
                     // Send start-of-gesture marker
                     GestureSample marker = {
@@ -410,6 +473,11 @@ static void fusion_task(void *arg)
                     ESP_LOGI(TAG, "Gesture captured: %d samples, %d ms%s",
                              gesture_len, gesture_ms,
                              time_exceeded ? " (time-capped)" : "");
+                }
+                else
+                {
+                    ESP_LOGI(TAG, "Gesture rejected: %d samples, %d ms (too short)",
+                             gesture_len, gesture_ms);
                 }
 
                 ESP_LOGI(TAG, "Transition to gesture inactive");

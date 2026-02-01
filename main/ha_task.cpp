@@ -101,8 +101,8 @@ static void wifi_init(void)
 
     wifi_config_t wifi_cfg = {
         .sta = {
-            .ssid = "YOUR_WIFI_SSID",
-            .password = "YOUR_WIFI_PASSWORD",
+            .ssid = "IOT",
+            .password = "",
         },
     };
 
@@ -132,7 +132,8 @@ static void mqtt_init(void)
                     .authentication = {
                         .password = "pass",
                     },
-                },*/
+                },
+        */
     };
 
     mqtt_client = esp_mqtt_client_init(&cfg);
