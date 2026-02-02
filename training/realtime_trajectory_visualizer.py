@@ -10,7 +10,7 @@ import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
 
 DEFAULT_PORT = "COM6"      # change for your system
-BAUD_RATE = 115200
+BAUD_RATE = 921600
 MAX_POINTS = 512           # how many recent points to show
 
 # ---------- Custom Buffer class ----------

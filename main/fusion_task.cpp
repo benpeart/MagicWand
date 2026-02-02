@@ -320,6 +320,13 @@ static void fusion_task(void *arg)
         {
             dt = (float)(now - last_ts) / 1e6f;
         }
+#ifdef DEBUG
+        // Validate dt for 200Hz sampling (0.005s nominal, allow ±100% variance)
+        if (dt <= 0.0f || dt > 0.01f)
+        {
+            ESP_LOGW(TAG, "Anomalous dt: %.6f s (expected ~0.005s at 200Hz)", dt);
+        }
+#endif // DEBUG
         last_ts = now;
 
         // Convert gyro to rad/s
@@ -327,7 +334,7 @@ static void fusion_task(void *arg)
         float gy = raw.gy * (M_PI / 180.0f);
         float gz = raw.gz * (M_PI / 180.0f);
 
-        // Update orientation with real Madgwick
+        // Update orientation with Madgwick
         madgwick_update(gx, gy, gz, raw.ax, raw.ay, raw.az, dt);
 
         // Rotate accel into world frame (raw)
@@ -349,6 +356,14 @@ static void fusion_task(void *arg)
             fabsf(raw.gx) < GYRO_STILL_THRESH &&
             fabsf(raw.gy) < GYRO_STILL_THRESH &&
             fabsf(raw.gz) < GYRO_STILL_THRESH;
+
+        // Gravity estimation (only when still)
+        if (still)
+        {
+            g_est_x = (1.0f - GRAVITY_LPF_ALPHA) * g_est_x + GRAVITY_LPF_ALPHA * ax_w;
+            g_est_y = (1.0f - GRAVITY_LPF_ALPHA) * g_est_y + GRAVITY_LPF_ALPHA * ay_w;
+            g_est_z = (1.0f - GRAVITY_LPF_ALPHA) * g_est_z + GRAVITY_LPF_ALPHA * az_w;
+        }
 
         // Movement detection
         bool moving =
@@ -374,80 +389,81 @@ static void fusion_task(void *arg)
             last_motion_ts = now;
         }
 
-        // Gravity estimation (only when still)
-        if (still)
-        {
-            g_est_x = (1.0f - GRAVITY_LPF_ALPHA) * g_est_x + GRAVITY_LPF_ALPHA * ax_w;
-            g_est_y = (1.0f - GRAVITY_LPF_ALPHA) * g_est_y + GRAVITY_LPF_ALPHA * ay_w;
-            g_est_z = (1.0f - GRAVITY_LPF_ALPHA) * g_est_z + GRAVITY_LPF_ALPHA * az_w;
-        }
-
-        // Integrate acceleration → velocity → position
-        if (still && !gesture_active)
-        {
-            // Aggressive reset when still: forget history (but NOT during gesture)
-            vel_x = vel_y = vel_z = 0.0f;
-            pos_x = pos_y = pos_z = 0.0f;
-        }
-        else
-        {
-            vel_x += ax * dt;
-            vel_y += ay * dt;
-            vel_z += az * dt;
-
-            pos_x += vel_x * dt;
-            pos_y += vel_y * dt;
-            pos_z += vel_z * dt;
-        }
-
-        // Project to 2D plane (X–Z) for gesture
-        GestureSample out = {
-            .timestamp_us = now,
-            .x = pos_x,
-            .y = pos_z};
-
-        // -----------------------------
-        // Gesture segmentation
-        // -----------------------------
+        // Detect motion and transition to gesture capture
         if (!gesture_active && moving)
         {
             ESP_LOGI(TAG, "Transition to gesture active");
             gesture_active = true;
             gesture_start_ts = now;
             gesture_len = 0;
+
+            // Reset state for fresh gesture tracking (before first integration)
+            vel_x = vel_y = vel_z = 0.0f;
+            pos_x = pos_y = pos_z = 0.0f;
         }
 
+        // -----------------------------
+        // Gesture segmentation
+        // -----------------------------
         if (gesture_active)
         {
+            // compute and save the gesture sample in the gesture buffer
             if (gesture_len < sizeof(gesture_buf) / sizeof(gesture_buf[0]))
             {
+                // Integrate acceleration → velocity → position
+                vel_x += ax * dt;
+                vel_y += ay * dt;
+                vel_z += az * dt;
+
+                pos_x += vel_x * dt;
+                pos_y += vel_y * dt;
+                pos_z += vel_z * dt;
+
+                // Project to 2D plane (X–Z) for gesture
+                GestureSample out = {
+                    .timestamp_us = now,
+                    .x = pos_x,
+                    .y = pos_z};
+
+                // store the position in our gesture buffer
                 gesture_buf[gesture_len++] = out;
             }
+#ifdef DEBUG            
             else
             {
                 ESP_LOGW(TAG, "Raw gesture buffer overflow — gesture truncated at %d samples", gesture_len);
             }
+#endif // DEBUG            
 
+            // detect the end of gesture
             uint32_t still_ms = (uint32_t)((now - last_motion_ts) / 1000);
             uint32_t gesture_ms = (uint32_t)((now - gesture_start_ts) / 1000);
-
             bool time_exceeded = (gesture_ms > MAX_GESTURE_MS);
 
             if (still_ms > STILLNESS_END_MS || time_exceeded)
             {
+                // remove all the trailing stillness samples by only keeping samples with timestamp <= last_motion_ts
+                while (gesture_len > 0 && gesture_buf[gesture_len - 1].timestamp_us > last_motion_ts)
+                {
+                    gesture_len--;
+                }
+
+                // reject too-short gestures
                 if (gesture_ms >= MIN_GESTURE_MS)
                 {
-#if 1
+#ifdef DEBUG
                     ESP_LOGI(TAG, "Pre normalized count[%d]\n", gesture_len);
                     for (int i = 0; i < gesture_len; i++)
                     {
                         printf("%" PRIu64 ",%f,%f\n", gesture_buf[i].timestamp_us, gesture_buf[i].x, gesture_buf[i].y);
                     }
-#endif
+#endif // DEBUG
+
                     // normalize the gesture samples
                     GestureSample norm[INFERENCE_WINDOW_SIZE];
                     int n = normalize_gesture(gesture_buf, gesture_len, norm);
-#if 1
+
+#ifdef DEBUG
                     ESP_LOGI(TAG, "Normalized count[%d]\n", n);
                     for (int i = 0; i < n; i++)
                     {
@@ -470,14 +486,11 @@ static void fusion_task(void *arg)
                             ESP_LOGW(TAG, "fusion_queue full, dropping sample %d of %d", i, n);
                         }
                     }
-                    ESP_LOGI(TAG, "Gesture captured: %d samples, %d ms%s",
-                             gesture_len, gesture_ms,
-                             time_exceeded ? " (time-capped)" : "");
+                    ESP_LOGI(TAG, "Gesture captured: %d samples, %d ms%s", gesture_len, gesture_ms, time_exceeded ? " (time-capped)" : "");
                 }
                 else
                 {
-                    ESP_LOGI(TAG, "Gesture rejected: %d samples, %d ms (too short)",
-                             gesture_len, gesture_ms);
+                    ESP_LOGI(TAG, "Gesture rejected: %d samples, %d ms (too short)", gesture_len, gesture_ms);
                 }
 
                 ESP_LOGI(TAG, "Transition to gesture inactive");
