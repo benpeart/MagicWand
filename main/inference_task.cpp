@@ -17,7 +17,7 @@
 // -----------------------------
 static const char *TAG = "inference_task";
 #define INFER_TASK_CORE 1
-#define INFER_TASK_PRIORITY 7
+#define INFER_TASK_PRIORITY 5
 #define INFER_TASK_STACK (12 * 1024)
 
 #define FEATURE_COUNT 2 // tip_x, tip_y

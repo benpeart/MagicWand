@@ -2,7 +2,6 @@
 #include <stdint.h>
 
 //#define DEBUG
-#define ENABLE_DATA_CAPTURE
 
 // Normalized gesture size (fixed for inference)
 #define INFERENCE_WINDOW_SIZE 256
@@ -12,14 +11,6 @@
 
 // 200 Hz sampling
 #define IMU_RATE_HZ 200
-
-// Raw IMU sample (from imu_task)
-typedef struct
-{
-    int64_t timestamp_us;
-    float ax, ay, az;
-    float gx, gy, gz;
-} RawImuSample;
 
 // gesture sample (from fusion_task)
 typedef struct {

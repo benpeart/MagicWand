@@ -1,7 +1,7 @@
 #pragma once
 
 /* --------------------------------------------------------------------------
- * fusion_task_start()
+ * gesture_task_start()
  *
  * PURPOSE:
  *   The fusion task is the real‑time sensor‑processing engine for the wand.
@@ -50,4 +50,4 @@
  *   A robust, real‑time motion‑capture pipeline that transforms raw IMU
  *   readings into clean, segmented gesture paths ready for ML inference.
  * -------------------------------------------------------------------------- */
-void fusion_task_start(void);
+void gesture_task_start(void);

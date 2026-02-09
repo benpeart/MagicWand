@@ -3,8 +3,7 @@
 #include "esp_log.h"
 #include "queues.h"
 #include "data_types.h"
-#include "imu_task.h"
-#include "fusion_task.h"
+#include "gesture_task.h"
 #include "inference_task.h"
 #include "ha_task.h"
 #include "data_capture_task.h"
@@ -17,9 +16,8 @@ extern "C" void app_main(void)
 
     queues_init();
 
-    imu_task_start();
-    fusion_task_start();
-#ifdef ENABLE_DATA_CAPTURE
+    gesture_task_start();
+#if 1
     capture_task_start();
 #else
     inference_task_start();

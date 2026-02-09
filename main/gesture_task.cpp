@@ -1,20 +1,35 @@
-#include "fusion_task.h"
+#include "gesture_task.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "queues.h"
-#include "data_types.h"
+#include "driver/i2c.h"
 #include "esp_timer.h"
 #include "esp_log.h"
 #include <math.h>
 #include <inttypes.h>
+#include "mpu6050.h"
+#include "queues.h"
+#include "data_types.h"
 
 // -----------------------------
 // Task Configuration
 // -----------------------------
-static const char *TAG = "fusion_task";
-#define FUSION_TASK_CORE 1
-#define FUSION_TASK_PRIORITY 5
-#define FUSION_TASK_STACK (16 * 1024)
+static const char *TAG = "gesture_task";
+#define GESTURE_TASK_CORE 1
+#define GESTURE_TASK_PRIORITY 8
+#define GESTURE_TASK_STACK (16 * 1024)
+
+// -----------------------------
+// I2C pins for ESP32-S3
+// -----------------------------
+#define I2C_PORT I2C_NUM_0
+#define I2C_SDA_PIN GPIO_NUM_8
+#define I2C_SCL_PIN GPIO_NUM_9
+
+static mpu6050_dev_t mpu;
+
+// -----------------------------
+// IMU configuration
+// -----------------------------
 
 // Use nominal IMU rate only as a fallback
 #define DT_FALLBACK_SEC (1.0f / IMU_RATE_HZ)
@@ -26,19 +41,6 @@ static const char *TAG = "fusion_task";
 // How fast gravity estimate adapts when still
 #define GRAVITY_LPF_ALPHA 0.03f // 1% update per still frame
 
-// Stillness detection thresholds
-#define ACC_STILL_THRESH 0.7f
-#define GYRO_STILL_THRESH 4.0f
-
-// Movement detection thresholds
-#define MOVE_ACCEL_THRESH 0.9f
-#define MOVE_GYRO_THRESH 15.0f
-
-// Gesture segmentation timing
-#define STILLNESS_END_MS 300 // end gesture after 300ms stillness
-#define MIN_GESTURE_MS 750   // reject gestures shorter than 750ms
-#define MAX_GESTURE_MS 3000  // hard cap at 3s
-
 // Madgwick quaternion state
 static float q0 = 1.0f, q1 = 0.0f, q2 = 0.0f, q3 = 0.0f;
 
@@ -46,10 +48,28 @@ static float q0 = 1.0f, q1 = 0.0f, q2 = 0.0f, q3 = 0.0f;
 static float pos_x = 0.0f, pos_y = 0.0f, pos_z = 0.0f;
 static float vel_x = 0.0f, vel_y = 0.0f, vel_z = 0.0f;
 
+// Standard gravity in m/s²
+#define GRAVITY 9.80665f
+
 // Gravity estimate in world frame
 static float g_est_x = 0.0f;
 static float g_est_y = 0.0f;
-static float g_est_z = 9.80665f; // start with nominal gravity
+static float g_est_z = GRAVITY; // start with nominal gravity
+
+// -----------------------------
+// Gesture configuration
+// -----------------------------
+
+// Thresholds tuned from captured data
+const float STILL_ENERGY_MAX = 1.05f; // energy near 1g
+const float STILL_GYRO_MAX = 0.05f;   // rad/s, very low rotation
+const float MOVING_START_THRESH = 1.8f;
+const float MOVING_STOP_THRESH = 1.2f;
+
+// Gesture segmentation timing
+#define STILLNESS_END_MS 300 // end gesture after 300ms stillness
+#define MIN_GESTURE_MS 750   // reject gestures shorter than 750ms
+#define MAX_GESTURE_MS 3000  // hard cap at 3s
 
 // Gesture segmentation state
 static bool gesture_active = false;
@@ -58,6 +78,11 @@ static uint64_t last_motion_ts = 0;
 
 static GestureSample gesture_buf[MAX_RAW_GESTURE_SAMPLES];
 static int gesture_len = 0;
+
+static inline float clamp01(float x)
+{
+    return fmaxf(0.0f, fminf(1.0f, x));
+}
 
 // -----------------------------
 // Rotate vector by quaternion
@@ -300,88 +325,158 @@ static int normalize_gesture(const GestureSample *in, int count, GestureSample *
 // ---------------------------------------------
 // Main fusion, segmentation, normalization task
 // ---------------------------------------------
-static void fusion_task(void *arg)
+static void gesture_task(void *arg)
 {
-    RawImuSample raw;
-    ESP_LOGI(TAG, "Entering fusion_task");
-
-    uint64_t last_ts = 0;
+    ESP_LOGI(TAG, "Entering gesture_task");
+    TickType_t last_wake = xTaskGetTickCount();
+    int64_t last_ts = 0;
 
     for (;;)
     {
-        if (xQueueReceive(g_imu_queue, &raw, portMAX_DELAY) != pdTRUE)
+        // Maintain fixed IMU_RATE_HZ schedule using FreeRTOS
+        vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(1000 / IMU_RATE_HZ));
+
+        // ------------------------------------------------
+        // Compute Linear Acceleration In World Coordinates
+        // ------------------------------------------------
+
+        // grab next IMU sample
+        mpu6050_raw_acceleration_t raw_acc;
+        mpu6050_raw_rotation_t raw_rot;
+
+        if (mpu6050_get_raw_acceleration(&mpu, &raw_acc) != ESP_OK ||
+            mpu6050_get_raw_rotation(&mpu, &raw_rot) != ESP_OK)
+        {
+            ESP_LOGW(TAG, "IMU read failed");
             continue;
+        }
+        int64_t now = esp_timer_get_time();
 
-        int64_t now = raw.timestamp_us;
-
-        // Compute dt from timestamps (seconds)
+        // Compute dt (seconds)
         float dt = DT_FALLBACK_SEC;
         if (last_ts != 0 && now > last_ts)
         {
             dt = (float)(now - last_ts) / 1e6f;
         }
-#ifdef DEBUG
         // Validate dt for 200Hz sampling (0.005s nominal, allow ±100% variance)
         if (dt <= 0.0f || dt > 0.01f)
         {
             ESP_LOGW(TAG, "Anomalous dt: %.6f s (expected ~0.005s at 200Hz)", dt);
         }
-#endif // DEBUG
         last_ts = now;
 
-        // Convert gyro to rad/s
-        float gx = raw.gx * (M_PI / 180.0f);
-        float gy = raw.gy * (M_PI / 180.0f);
-        float gz = raw.gz * (M_PI / 180.0f);
+        // Convert from raw accel (LSB) to m/s²
+        const float accel_scale = 1.0f / 8192.0f; // ±4g
+        float ax = (float)raw_acc.x * accel_scale * GRAVITY;
+        float ay = (float)raw_acc.y * accel_scale * GRAVITY;
+        float az = (float)raw_acc.z * accel_scale * GRAVITY;
+
+        // Conversion from raw gyro (LSB) to rad/s
+        const float gyro_scale_rad = (1.0f / 65.5f) * (M_PI / 180.0f); // for ±500°/s
+        float gx = (float)raw_rot.x * gyro_scale_rad;
+        float gy = (float)raw_rot.y * gyro_scale_rad;
+        float gz = (float)raw_rot.z * gyro_scale_rad;
 
         // Update orientation with Madgwick
-        madgwick_update(gx, gy, gz, raw.ax, raw.ay, raw.az, dt);
+        madgwick_update(gx, gy, gz, ax, ay, az, dt);
 
-        // Rotate accel into world frame (raw)
-        float ax_w = raw.ax;
-        float ay_w = raw.ay;
-        float az_w = raw.az;
-        rotate_vector(&ax_w, &ay_w, &az_w);
+        // Rotate accel into world frame
+        rotate_vector(&ax, &ay, &az);
+
+        // After rotate_vector, before subtracting gravity:
+        float a_world_x = ax;
+        float a_world_y = ay;
+        float a_world_z = az;
 
         // Remove estimated gravity (world frame → linear accel)
-        float ax = ax_w - g_est_x;
-        float ay = ay_w - g_est_y;
-        float az = az_w - g_est_z;
+        ax -= g_est_x;
+        ay -= g_est_y;
+        az -= g_est_z;
 
-        // Stillness detection (raw accel + raw gyro)
-        bool still =
-            fabsf(ax) < ACC_STILL_THRESH &&
-            fabsf(ay) < ACC_STILL_THRESH &&
-            fabsf(az) < ACC_STILL_THRESH &&
-            fabsf(raw.gx) < GYRO_STILL_THRESH &&
-            fabsf(raw.gy) < GYRO_STILL_THRESH &&
-            fabsf(raw.gz) < GYRO_STILL_THRESH;
+        // Compute motion energy for stillness/movement detection
+        float a_mag = sqrtf(ax * ax + ay * ay + az * az);
+        float g_mag = sqrtf(gx * gx + gy * gy + gz * gz);
+        float motion_energy = a_mag + 0.15f * g_mag;
+
+        // Smooth
+        static float smoothed_motion_energy = 0.0f;
+        smoothed_motion_energy = 0.85f * smoothed_motion_energy + 0.15f * motion_energy;
+
+        // ------------------------------------------
+        // Remove acceleration due to gravity adaptively
+        // ------------------------------------------
+#if 1
+        // Motion energy already computed: smoothed_motion_energy
+
+        // Map motion energy to a [0,1] "stillness factor"
+        float still_factor = 1.0f - clamp01((smoothed_motion_energy - 1.0f) / (MOVING_START_THRESH - 1.0f));
+
+        // still_factor ≈1 near rest, →0 as you approach strong motion
+        float alpha = GRAVITY_LPF_ALPHA * still_factor;
+        g_est_x = (1.0f - alpha) * g_est_x + alpha * a_world_x;
+        g_est_y = (1.0f - alpha) * g_est_y + alpha * a_world_y;
+        g_est_z = (1.0f - alpha) * g_est_z + alpha * a_world_z;
+#endif
+#ifdef GRAVITY_DURING_STILLNESS
+        // Instantaneous stillness
+        // Bad and removes too much acceleration-based motion
+        bool inst_still = (smoothed_motion_energy < STILL_ENERGY_MAX) && (g_mag < STILL_GYRO_MAX);
+
+        // Require N consecutive still frames to avoid flicker
+        static int still_count = 0;
+        if (inst_still)
+        {
+            still_count++;
+        }
+        else
+        {
+            still_count = 0;
+        }
+        bool still = (still_count >= 20); // ~100 ms at 200 Hz
 
         // Gravity estimation (only when still)
         if (still)
         {
-            g_est_x = (1.0f - GRAVITY_LPF_ALPHA) * g_est_x + GRAVITY_LPF_ALPHA * ax_w;
-            g_est_y = (1.0f - GRAVITY_LPF_ALPHA) * g_est_y + GRAVITY_LPF_ALPHA * ay_w;
-            g_est_z = (1.0f - GRAVITY_LPF_ALPHA) * g_est_z + GRAVITY_LPF_ALPHA * az_w;
+            g_est_x = (1.0f - GRAVITY_LPF_ALPHA) * g_est_x + GRAVITY_LPF_ALPHA * ax;
+            g_est_y = (1.0f - GRAVITY_LPF_ALPHA) * g_est_y + GRAVITY_LPF_ALPHA * ay;
+            g_est_z = (1.0f - GRAVITY_LPF_ALPHA) * g_est_z + GRAVITY_LPF_ALPHA * az;
         }
+#endif // GRAVITY_DURING_STILLNESS
+#ifdef GRAVITY_FROM_QUATERNION
+        // Compute gravity from the quaternion every frame
+        // Terrible as it removes all acceleration based motion
+        g_est_x = (2 * (q1 * q3 - q0 * q2)) * GRAVITY;
+        g_est_y = (2 * (q0 * q1 + q2 * q3)) * GRAVITY;
+        g_est_z = (q0 * q0 - q1 * q1 - q2 * q2 + q3 * q3) * GRAVITY;
+#endif // GRAVITY_FROM_QUATERNION
 
-        // Movement detection
-        bool moving =
-            fabsf(ax) > MOVE_ACCEL_THRESH ||
-            fabsf(ay) > MOVE_ACCEL_THRESH ||
-            fabsf(az) > MOVE_ACCEL_THRESH ||
-            fabsf(raw.gx) > MOVE_GYRO_THRESH ||
-            fabsf(raw.gy) > MOVE_GYRO_THRESH ||
-            fabsf(raw.gz) > MOVE_GYRO_THRESH;
 #ifdef DEBUG
+        // Output one clean CSV-style line per sample to use to tune thresholds.
+        ESP_LOGI("GESTURE_DBG",
+                 "RAW_ACC: %d,%d,%d  "
+                 "RAW_GYRO: %d,%d,%d  "
+                 "LIN_ACC: %.3f,%.3f,%.3f  "
+                 "GYRO_RAD: %.3f,%.3f,%.3f  "
+                 "A_MAG: %.5f  G_MAG: %.5f  E: %.5f  ACTIVE:%d",
+                 raw_acc.x, raw_acc.y, raw_acc.z,
+                 raw_rot.x, raw_rot.y, raw_rot.z,
+                 ax, ay, az,
+                 gx, gy, gz,
+                 a_mag, g_mag, motion_energy,
+                 gesture_active ? 1 : 0);
+#endif
+        // ------------------------------------------
+        // Detect when we start to cast a spell
+        // ------------------------------------------
+
+        bool moving = smoothed_motion_energy > MOVING_START_THRESH;
+#if 0
         static int counter = 0;
         if (++counter % 50 == 0)
         {
-            ESP_LOGI(TAG, "xQueueReceive: %" PRIu64 ",%f,%f,%f,%f,%f,%f",
-                     raw.timestamp_us, raw.ax, raw.ay, raw.az, raw.gx, raw.gy, raw.gz);
-            ESP_LOGI(TAG, "Still: %s, Moving: %s: %" PRIu64 ",%f,%f,%f,%f,%f,%f",
+            ESP_LOGI(TAG, "Still: %s, Moving: %s: %" PRIu64 ",%f",
                      still ? "true" : "false", moving ? "true" : "false",
-                     raw.timestamp_us, ax, ay, az, raw.gx, raw.gy, raw.gz);
+                     now, smoothed_motion_energy);
         }
 #endif // DEBUG
         if (moving)
@@ -402,13 +497,13 @@ static void fusion_task(void *arg)
             pos_x = pos_y = pos_z = 0.0f;
         }
 
-        // -----------------------------
-        // Gesture segmentation
-        // -----------------------------
+        // ---------------------------------------------
+        // Capture the Gesture and detect end of gesture
+        // ---------------------------------------------
         if (gesture_active)
         {
             // compute and save the gesture sample in the gesture buffer
-            if (gesture_len < sizeof(gesture_buf) / sizeof(gesture_buf[0]))
+            if (gesture_len < MAX_RAW_GESTURE_SAMPLES)
             {
                 // Integrate acceleration → velocity → position
                 vel_x += ax * dt;
@@ -428,19 +523,19 @@ static void fusion_task(void *arg)
                 // store the position in our gesture buffer
                 gesture_buf[gesture_len++] = out;
             }
-#ifdef DEBUG            
+#ifdef DEBUG
             else
             {
                 ESP_LOGW(TAG, "Raw gesture buffer overflow — gesture truncated at %d samples", gesture_len);
             }
-#endif // DEBUG            
+#endif // DEBUG
 
             // detect the end of gesture
-            uint32_t still_ms = (uint32_t)((now - last_motion_ts) / 1000);
             uint32_t gesture_ms = (uint32_t)((now - gesture_start_ts) / 1000);
             bool time_exceeded = (gesture_ms > MAX_GESTURE_MS);
 
-            if (still_ms > STILLNESS_END_MS || time_exceeded)
+            // End gesture
+            if (smoothed_motion_energy < MOVING_STOP_THRESH || time_exceeded)
             {
                 // remove all the trailing stillness samples by only keeping samples with timestamp <= last_motion_ts
                 while (gesture_len > 0 && gesture_buf[gesture_len - 1].timestamp_us > last_motion_ts)
@@ -451,25 +546,9 @@ static void fusion_task(void *arg)
                 // reject too-short gestures
                 if (gesture_ms >= MIN_GESTURE_MS)
                 {
-#ifdef DEBUG
-                    ESP_LOGI(TAG, "Pre normalized count[%d]\n", gesture_len);
-                    for (int i = 0; i < gesture_len; i++)
-                    {
-                        printf("%" PRIu64 ",%f,%f\n", gesture_buf[i].timestamp_us, gesture_buf[i].x, gesture_buf[i].y);
-                    }
-#endif // DEBUG
-
                     // normalize the gesture samples
                     GestureSample norm[INFERENCE_WINDOW_SIZE];
                     int n = normalize_gesture(gesture_buf, gesture_len, norm);
-
-#ifdef DEBUG
-                    ESP_LOGI(TAG, "Normalized count[%d]\n", n);
-                    for (int i = 0; i < n; i++)
-                    {
-                        printf("%" PRIu64 ",%f,%f\n", norm[i].timestamp_us, norm[i].x, norm[i].y);
-                    }
-#endif // DEBUG
 
                     // Send start-of-gesture marker
                     GestureSample marker = {
@@ -504,14 +583,32 @@ static void fusion_task(void *arg)
     }
 }
 
-void fusion_task_start(void)
+void gesture_task_start(void)
 {
+    ESP_ERROR_CHECK(i2cdev_init());
+
+    // Create device descriptor
+    ESP_ERROR_CHECK(mpu6050_init_desc(
+        &mpu,
+        MPU6050_I2C_ADDRESS_LOW,
+        I2C_PORT,
+        I2C_SDA_PIN,
+        I2C_SCL_PIN));
+
+    // Initialize chip
+    ESP_ERROR_CHECK(mpu6050_init(&mpu));
+
+    // Configure full-scale ranges
+    ESP_ERROR_CHECK(mpu6050_set_full_scale_accel_range(&mpu, MPU6050_ACCEL_RANGE_4));
+    ESP_ERROR_CHECK(mpu6050_set_full_scale_gyro_range(&mpu, MPU6050_GYRO_RANGE_500));
+    ESP_LOGI(TAG, "MPU6050 initialized (esp-idf-lib)");
+
     xTaskCreatePinnedToCore(
-        fusion_task,
+        gesture_task,
         TAG,
-        FUSION_TASK_STACK,
+        GESTURE_TASK_STACK,
         NULL,
-        FUSION_TASK_PRIORITY,
+        GESTURE_TASK_PRIORITY,
         NULL,
-        FUSION_TASK_CORE);
+        GESTURE_TASK_CORE);
 }
