@@ -2,6 +2,9 @@
 # Settings for the Hosyond ESP32-S3 Development Board N16R8 MCU
 # https://www.amazon.com/dp/B0F5QCK6X5?th=1
 #
+# and the Teyleten Robot GY- BNO085
+# https://www.amazon.com/dp/B0CL26J81F
+#
 
 #
 # CPU & Performance
@@ -9,6 +12,7 @@
 CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
 CONFIG_COMPILER_OPTIMIZATION_PERF=y
 CONFIG_FREERTOS_HZ=1000         # needed so we can run at 200Hz sampling rate
+#CONFIG_FREERTOS_TICK_RATE_HZ=1000
 
 #
 # Flash (ESP-1-N16R8 module)
@@ -27,17 +31,23 @@ CONFIG_SPIRAM_TYPE_AUTO=y       # Let IDF auto‑detect the PSRAM type
 CONFIG_SPIRAM_USE_MALLOC=y      # Use PSRAM as heap
 
 #
+# GPIO Configuration for Hosyond ESP32S3
+#
+# Use pins that are not connected to the SPI flash (GPIO6–GPIO11) and 
+# avoid UART0 pins (GPIO1/GPIO3).
+#
+CONFIG_ESP32_BNO08X_GPIO_HINT=4
+CONFIG_ESP32_BNO08X_GPIO_RST=5
+CONFIG_ESP32_BNO08X_GPIO_CS=15
+CONFIG_ESP32_BNO08X_GPIO_SCL=18
+CONFIG_ESP32_BNO08X_GPIO_SDA=14
+CONFIG_ESP32_BNO08X_GPIO_DI=13
+
 # Power Management
 #
 CONFIG_PM_ENABLE=y
 CONFIG_PM_DFS_INIT_AUTO=y
 CONFIG_FREERTOS_USE_TICKLESS_IDLE=y
-
-#
-# I2C / IMU stability
-#
-CONFIG_I2CDEV_USE_LEGACY_DRIVER=y   # needed for MPU6050
-CONFIG_I2C_ISR_IRAM_SAFE=y
 
 #
 # Watchdogs

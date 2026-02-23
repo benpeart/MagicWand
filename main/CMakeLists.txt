@@ -22,8 +22,9 @@ idf_component_register(
 
         # Third-party libs
         esp-tflite-micro
-        i2cdev
-        mpu6050
+
+        # BNO08x IMU sensor fusion
+        esp32_BNO08x
 
         # Internal shared code
 #        test_data

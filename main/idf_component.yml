@@ -1,4 +1,3 @@
 dependencies:
   espressif/esp-tflite-micro:
     version: '*'
-  esp-idf-lib/mpu6050: '*'

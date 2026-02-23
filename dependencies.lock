@@ -1,54 +1,4 @@
 dependencies:
-  esp-idf-lib/esp_idf_lib_helpers:
-    component_hash: 689853bb8993434f9556af0f2816e808bf77b5d22100144b21f3519993daf237
-    dependencies: []
-    source:
-      registry_url: https://components.espressif.com/
-      type: service
-    targets:
-    - esp32
-    - esp32c2
-    - esp32c3
-    - esp32c5
-    - esp32c6
-    - esp32c61
-    - esp32h2
-    - esp32p4
-    - esp32s2
-    - esp32s3
-    version: 1.4.0
-  esp-idf-lib/i2cdev:
-    dependencies: []
-    source:
-      path: C:\src\MagicWand\components\esp-idf-lib__i2cdev
-      type: local
-    version: 2.1.1
-  esp-idf-lib/mpu6050:
-    component_hash: 2d4c6db42322162aeadded002cb811028f05115d969e143bad6470822cc75a8a
-    dependencies:
-    - name: esp-idf-lib/esp_idf_lib_helpers
-      registry_url: https://components.espressif.com
-      require: private
-      version: '*'
-    - name: esp-idf-lib/i2cdev
-      registry_url: https://components.espressif.com
-      require: private
-      version: '*'
-    source:
-      registry_url: https://components.espressif.com/
-      type: service
-    targets:
-    - esp32
-    - esp32c2
-    - esp32c3
-    - esp32c5
-    - esp32c6
-    - esp32c61
-    - esp32h2
-    - esp32p4
-    - esp32s2
-    - esp32s3
-    version: 2.1.9
   espressif/esp-nn:
     component_hash: f4633a02f05fef53b80de65ade1f733ebdef637e4c8b8be4eb11f5e27f6d9f3e
     dependencies:
@@ -78,9 +28,7 @@ dependencies:
       type: idf
     version: 5.5.1
 direct_dependencies:
-- esp-idf-lib/esp_idf_lib_helpers
-- esp-idf-lib/mpu6050
 - espressif/esp-tflite-micro
-manifest_hash: 1c794cb0fa1de2731b2c92bacb0c6caf76fe4453c04242fe16a9a6b6aba7a4a5
+manifest_hash: cde8dae00d38eef8cec787ab91f748b0cd5f0ccb4615189e6b7265ecee0d3022
 target: esp32s3
 version: 2.0.0

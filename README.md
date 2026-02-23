@@ -1,3 +1,6 @@
+# **Unleash Magical Control of your Home Automation**
+Step into a world where home automation feels like wizardry. The MagicWand blends precision IMU sensing with on‑device TensorFlow Lite to recognize your unique “spells” and instantly trigger Home Assistant automations. No buttons, no menus—just a flick, a flourish, and your home responds. It’s fast, intuitive, and delightfully immersive, turning everyday actions into moments of real magic.
+
 # Magic Wand Firmware Architecture
 
 This document describes the architecture of the Magic Wand firmware, the responsibilities of each module, and how the system components work together to produce stable, real‑time gesture recognition on the ESP32‑S3.
