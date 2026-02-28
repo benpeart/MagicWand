@@ -17,7 +17,7 @@
 // -----------------------------
 static const char *TAG = "data_capture_task";
 #define CAPTURE_TASK_CORE 1
-#define CAPTURE_TASK_PRIORITY 5
+#define CAPTURE_TASK_PRIORITY 4
 #define CAPTURE_TASK_STACK (4 * 1024)
 
 static void capture_task(void *arg)

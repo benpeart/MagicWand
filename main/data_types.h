@@ -1,28 +1,27 @@
 #pragma once
 #include <stdint.h>
 
-//#define DEBUG
-
 // Normalized gesture size (fixed for inference)
-// When you resample each captured gesture to 128 points, a 1 s gesture maps to 128 Hz
-// effective resolution; a 3 s gesture maps to ~43 Hz effective resolution — both are
-// sufficient for IMU gesture shapes while keeping the model small and fast.
-#define INFERENCE_WINDOW_SIZE 128
+// Set to 300 samples (3.0 s @ 100 Hz) as recommended for 1-3 s gestures.
+#define INFERENCE_WINDOW_SIZE 300
 
 // IMU sample structure (per-sample)
 // This struct is the payload we send to the fusion queue.
 typedef struct
 {
-    // Output time relative to gesture start (t0), in microseconds. This allows the model to learn temporal patterns.
+    // Output time relative to gesture start (t0), in microseconds.
     uint32_t timestamp_us;
+
     // Linear acceleration (sensor frame), m/s^2
     float ax;
     float ay;
     float az;
+
     // Calibrated Gyroscope (sensor frame), rad/s
     float gx;
     float gy;
     float gz;
+
     // Quaternion (game rotation vector / fused orientation)
     float qw;
     float qx;
