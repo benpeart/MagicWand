@@ -38,7 +38,6 @@ static const char *TAG = "gesture_task";
 // =========================================================================
 // IMU Sampling Configuration
 // =========================================================================
-#define IMU_RATE_HZ 100
 #define SAMPLE_PERIOD_US (1000000 / IMU_RATE_HZ)
 
 #define CLASSIFIER_SAMPLES INFERENCE_WINDOW_SIZE
@@ -93,14 +92,28 @@ static inline void ring_push_sample(const RawSample *s)
         ring_count++;
 }
 
+// Helper: Calculate distance in ring buffer (accounting for wrap-around)
+// Returns the number of samples from start_idx to end_idx going forward in the ring
+static int ring_distance(int start_idx, int end_idx)
+{
+    if (end_idx >= start_idx)
+        return end_idx - start_idx + 1;
+    else
+        return (RING_CAPACITY - start_idx) + end_idx + 1;
+}
+
 static int ring_get_samples(RawSample *out, int start_idx, int n)
 {
     if (n > RING_CAPACITY)
         return -1;
     if (n > ring_count)
     {
+#ifdef DEBUG_SENSOR_DATA
+        ESP_LOGD(TAG, "ring_get_samples: insufficient samples in ring (have %d, requested %d)", ring_count, n);
+#endif
         return -1;
     }
+
     int idx = start_idx;
     for (int i = 0; i < n; ++i)
     {
@@ -109,6 +122,21 @@ static int ring_get_samples(RawSample *out, int start_idx, int n)
         if (idx >= RING_CAPACITY)
             idx = 0;
     }
+
+#ifdef DEBUG_SENSOR_DATA
+    // Verify monotonic timestamps during extraction
+    if (n >= 2)
+    {
+        int64_t first_ts = out[0].timestamp_us;
+        int64_t last_ts = out[n - 1].timestamp_us;
+        if (last_ts < first_ts)
+        {
+            ESP_LOGW(TAG, "ring_get_samples WARNING: non-monotonic timestamps! first=%" PRId64 " last=%" PRId64 " (wrapped around?)",
+                     first_ts, last_ts);
+            return -1; // Reject due to timestamp inversion
+        }
+    }
+#endif
 
     return 0;
 }
@@ -225,16 +253,31 @@ static int normalize_gesture(const RawSample *in, int count, GestureSample *out)
 {
     // Require at least two samples to interpolate
     if (!(count >= 2 && count <= RING_CAPACITY))
+    {
+#ifdef DEBUG_SENSOR_DATA
+        ESP_LOGW(TAG, "normalize_gesture FAILED: invalid sample count=%d (need 2-%d)", count, RING_CAPACITY);
+#endif
         return 0;
+    }
 
     int64_t t0 = in[0].timestamp_us;
     int64_t tN = in[count - 1].timestamp_us;
     if (tN <= t0)
+    {
+#ifdef DEBUG_SENSOR_DATA
+        ESP_LOGW(TAG, "normalize_gesture FAILED: invalid timestamps t0=%" PRId64 " tN=%" PRId64, t0, tN);
+#endif
         return 0;
+    }
 
     int64_t duration = tN - t0;
     if (duration == 0)
+    {
+#ifdef DEBUG_SENSOR_DATA
+        ESP_LOGW(TAG, "normalize_gesture FAILED: zero duration (t0=tN=%" PRId64 ")", t0);
+#endif
         return 0;
+    }
 
     // Resample to INFERENCE_WINDOW_SIZE using linear interpolation for accel/gyro
     // and quaternion interpolation (shortest-path sign flip + NLERP/SLERP).
@@ -418,6 +461,10 @@ static int normalize_gesture(const RawSample *in, int count, GestureSample *out)
         // quaternions remain unit-length and are left as-is (they encode relative orientation)
     }
 
+#ifdef DEBUG_SENSOR_DATA
+    ESP_LOGD(TAG, "normalize_gesture SUCCESS: processed %d samples over duration %" PRId64 " µs", count, duration);
+#endif
+
     return INFERENCE_WINDOW_SIZE;
 }
 
@@ -464,6 +511,7 @@ static void gesture_task(void *arg)
         static int rv_update_count = 0;
         static int la_update_count = 0;
         static int cg_update_count = 0;
+        static int sc_update_count = 0;
         static int sample_count = 0;
 
         if (freq_window_start == 0)
@@ -476,6 +524,8 @@ static void gesture_task(void *arg)
             la_update_count++;
         if (imu.rpt.cal_gyro.has_new_data())
             cg_update_count++;
+        if (imu.rpt.stability_classifier.has_new_data())
+            sc_update_count++;
 
         sample_count++;
 
@@ -487,14 +537,16 @@ static void gesture_task(void *arg)
             float rv_freq = rv_update_count / elapsed_s;
             float la_freq = la_update_count / elapsed_s;
             float cg_freq = cg_update_count / elapsed_s;
-            ESP_LOGI(TAG, "Actual update frequency (%.2f s) - RV: %.1f Hz | LA: %.1f Hz | CG: %.1f Hz",
-                     elapsed_s, rv_freq, la_freq, cg_freq);
+            float sc_freq = sc_update_count / elapsed_s;
+            ESP_LOGI(TAG, "Actual update frequency (%.2f s) - RV: %.1f Hz | LA: %.1f Hz | CG: %.1f Hz | SC: %.1f Hz",
+                     elapsed_s, rv_freq, la_freq, cg_freq, sc_freq);
 
             // Reset counters
             freq_window_start = now;
             rv_update_count = 0;
             la_update_count = 0;
             cg_update_count = 0;
+            sc_update_count = 0;
             sample_count = 0;
         }
 #endif // DEBUG_SENSOR_DATA
@@ -508,7 +560,7 @@ static void gesture_task(void *arg)
 
         // Validate data bounds to catch sensor errors/glitches
 #ifdef DEBUG_SENSOR_DATA
-        const float ACCEL_MAX = 50.0f; // m/s²
+        const float ACCEL_MAX = 30.0f; // m/s² (typical air gesture ~5-30 m/s², impacts >50 m/s²)
         const float GYRO_MAX = 500.0f; // deg/s
         const float QUAT_MIN = 0.9f;   // Unit quaternion magnitude should be ~1.0
         const float QUAT_MAX = 1.1f;
@@ -613,11 +665,19 @@ static void gesture_task(void *arg)
         {
             if (moving)
             {
-                ESP_LOGI(TAG, "Transition to ACTIVE (motion detected: %.3f m/s²)", smoothed_motion_energy);
-                state = GestureState::ACTIVE;
-                gesture_start_ts = now;
-                trigger_ring_index = ring_index_of_last_sample();
-                samples_since_trigger = 0;
+                // Ensure we have enough pre-trigger samples in the ring buffer
+                if (ring_count >= PRE_TRIGGER_SAMPLES)
+                {
+                    ESP_LOGI(TAG, "Transition to ACTIVE (motion detected: %.3f m/s², ring_count=%d)", smoothed_motion_energy, ring_count);
+                    state = GestureState::ACTIVE;
+                    gesture_start_ts = now;
+                    trigger_ring_index = ring_index_of_last_sample();
+                    samples_since_trigger = 0;
+                }
+                else
+                {
+                    ESP_LOGD(TAG, "Motion detected but insufficient pre-trigger samples: have %d, need %d", ring_count, PRE_TRIGGER_SAMPLES);
+                }
             }
             break;
         }
@@ -680,7 +740,7 @@ static void gesture_task(void *arg)
                             int n = normalize_gesture(window_raw, CLASSIFIER_SAMPLES, norm);
                             if (n == INFERENCE_WINDOW_SIZE)
                             {
-                    // Send start-of-gesture marker (timestamp_us = 0, ax = NAN)
+                                // Send start-of-gesture marker (timestamp_us = 0, ax = NAN)
                                 GestureSample marker;
                                 marker.timestamp_us = 0;
                                 marker.ax = NAN;
@@ -705,7 +765,7 @@ static void gesture_task(void *arg)
                                     }
                                 }
 
-                    // Send normalized gesture samples
+                                // Send normalized gesture samples
                                 for (int i = 0; i < n; i++)
                                 {
                                     if (xQueueSend(g_fusion_queue, &norm[i], 0) != pdTRUE)
@@ -789,7 +849,7 @@ void gesture_task_start(void)
     if (!imu.rpt.cal_gyro.enable(SAMPLE_PERIOD_US))
         ESP_LOGE(TAG, "Calibrated Gyroscope: FAILED");
 
-    if (!imu.rpt.stability_classifier.enable(SAMPLE_PERIOD_US / 4))
+    if (!imu.rpt.stability_classifier.enable(SAMPLE_PERIOD_US * 4))
         ESP_LOGE(TAG, "Stability Classifier: FAILED");
 
     // Start gesture processing task
