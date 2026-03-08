@@ -1,44 +1,51 @@
 #
-# Settings for the Hosyond ESP32-S3 Development Board N16R8 MCU
-# https://www.amazon.com/dp/B0F5QCK6X5?th=1
+# Settings for the ESP32-S3-DevKitC-1-N32R16V Development Board
+# https://www.amazon.com/dp/B0FDG3WJDX
 #
-# and the Teyleten Robot GY- BNO085
-# https://www.amazon.com/dp/B0CL26J81F
+# and the Adafruit 9-DOF Orientation IMU Fusion Breakout - BNO085
+# https://www.adafruit.com/product/4754
 #
 
 #
 # CPU & Performance
 #
+# needed so we can run at 200Hz sampling rate
+CONFIG_FREERTOS_HZ=1000
 CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
 CONFIG_COMPILER_OPTIMIZATION_PERF=y
-CONFIG_FREERTOS_HZ=1000         # needed so we can run at 200Hz sampling rate
 
 #
 # ESP32-S3-DevKitC-1-N32R16V Development Board
 #
-CONFIG_ESPTOOLPY_FLASHMODE_OCT=y
+CONFIG_ESPTOOLPY_OCT_FLASH=y
 CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
 CONFIG_ESPTOOLPY_FLASHSIZE_32MB=y
 
 #
 # PSRAM (Integrated PSRAM on S3 uses octal (OPI) mode)
 #
-CONFIG_SPIRAM=y                 # Enable PSRAM
-CONFIG_SPIRAM_MODE_OCT=y        # Use octal PSRAM mode (embedded)
-CONFIG_SPIRAM_SPEED_80M=y       # PSRAM speed (80 MHz is safe; 120 MHz does not work)
-CONFIG_SPIRAM_TYPE_AUTO=y       # Let IDF auto‑detect the PSRAM type
-CONFIG_SPIRAM_USE_MALLOC=y      # Use PSRAM as heap
+# Enable PSRAM
+# Use octal PSRAM mode (embedded)
+# PSRAM speed (80 MHz is safe; 120 MHz does not work)
+# Let IDF auto-detect the PSRAM type
+# Use PSRAM as heap
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_SPEED_80M=y
+CONFIG_SPIRAM_TYPE_AUTO=y
+CONFIG_SPIRAM_USE_MALLOC=y
 
 #
 # GPIO Configuration for ESP32-S3-DevKitC-1-N32R16V Development Board
 #
-CONFIG_ESP32_BNO08X_GPIO_HINT=17   # INT (interrupt, active low)
-CONFIG_ESP32_BNO08X_GPIO_RST=16    # RST (reset, active low)
-CONFIG_ESP32_BNO08X_GPIO_CS=5      # CS (chip select, active low)
-CONFIG_ESP32_BNO08X_GPIO_SCL=18    # SCK (SPI clock)
-CONFIG_ESP32_BNO08X_GPIO_SDA=15    # MISO (sensor -> MCU)
-CONFIG_ESP32_BNO08X_GPIO_DI=21     # MOSI (MCU -> sensor)
+CONFIG_ESP32_BNO08X_GPIO_HINT=17
+CONFIG_ESP32_BNO08X_GPIO_RST=16
+CONFIG_ESP32_BNO08X_GPIO_CS=5
+CONFIG_ESP32_BNO08X_GPIO_SCL=18
+CONFIG_ESP32_BNO08X_GPIO_SDA=15
+CONFIG_ESP32_BNO08X_GPIO_DI=21
 
+#
 # Power Management
 #
 CONFIG_PM_ENABLE=y
@@ -58,6 +65,9 @@ CONFIG_FREERTOS_CHECK_STACKOVERFLOW_CANARY=y
 #
 # Logging
 #
+CONFIG_ESP_CONSOLE_UART=y
+CONFIG_ESP_CONSOLE_UART_DEFAULT=n
+CONFIG_ESP_CONSOLE_UART_CUSTOM=y
 CONFIG_ESP_CONSOLE_UART_BAUDRATE=921600
 CONFIG_LOG_DEFAULT_LEVEL_INFO=y
 CONFIG_LOG_COLORS=y

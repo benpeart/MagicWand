@@ -2,9 +2,19 @@
 #include <stdint.h>
 
 // Normalized gesture size (fixed for inference)
-// Set to 300 samples (3.0 s @ 100 Hz) as recommended for 1-3 s gestures.
 #define IMU_RATE_HZ 200
-#define INFERENCE_WINDOW_SIZE (3 * IMU_RATE_HZ)
+
+#define PRE_TRIGGER_MS 500
+#define PRE_TRIGGER_SAMPLES ((IMU_RATE_HZ * PRE_TRIGGER_MS) / 1000)
+
+#define CLASSIFIER_MS 3000
+#define CLASSIFIER_SAMPLES ((IMU_RATE_HZ * CLASSIFIER_MS) / 1000)
+
+#define POST_PADDING_MS 500
+#define POST_PADDING_SAMPLES ((IMU_RATE_HZ * POST_PADDING_MS) / 1000)
+
+#define INFERENCE_WINDOW_SIZE (PRE_TRIGGER_SAMPLES + CLASSIFIER_SAMPLES + POST_PADDING_SAMPLES)
+
 
 // IMU sample structure (per-sample)
 // This struct is the payload we send to the fusion queue.
