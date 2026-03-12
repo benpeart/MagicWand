@@ -5,23 +5,23 @@
 #define IMU_RATE_HZ 200
 
 #define PRE_TRIGGER_MS 500
-#define PRE_TRIGGER_SAMPLES ((IMU_RATE_HZ * PRE_TRIGGER_MS) / 1000)
+#define PRE_TRIGGER_SAMPLES (((IMU_RATE_HZ * PRE_TRIGGER_MS) / 1000) + 1)
 
-#define CLASSIFIER_MS 3000
-#define CLASSIFIER_SAMPLES ((IMU_RATE_HZ * CLASSIFIER_MS) / 1000)
+#define GESTURE_MS 3000
+#define GESTURE_SAMPLES (((IMU_RATE_HZ * GESTURE_MS) / 1000) + 1)
 
 #define POST_PADDING_MS 500
-#define POST_PADDING_SAMPLES ((IMU_RATE_HZ * POST_PADDING_MS) / 1000)
+#define POST_PADDING_SAMPLES (((IMU_RATE_HZ * POST_PADDING_MS) / 1000) + 1)
 
-#define INFERENCE_WINDOW_SIZE (PRE_TRIGGER_SAMPLES + CLASSIFIER_SAMPLES + POST_PADDING_SAMPLES)
-
+#define INFERENCE_WINDOW_MS (PRE_TRIGGER_MS + GESTURE_MS + POST_PADDING_MS)
+#define INFERENCE_WINDOW_SAMPLES (((IMU_RATE_HZ * INFERENCE_WINDOW_MS) / 1000) + 1)
 
 // IMU sample structure (per-sample)
 // This struct is the payload we send to the fusion queue.
 typedef struct
 {
-    // Output time relative to gesture start (t0), in microseconds.
-    uint32_t timestamp_us;
+    // Output time relative to gesture start (t0), in milliseconds.
+    uint32_t timestamp_ms;
 
     // Linear acceleration (sensor frame), m/s^2
     float ax;
@@ -53,6 +53,6 @@ typedef enum
 
 typedef struct
 {
-    int64_t timestamp_us; // Absolute timestamp (microseconds from boot)
+//    int64_t timestamp_us; // Absolute timestamp (microseconds from boot)
     GestureType gesture;
 } GestureEvent;

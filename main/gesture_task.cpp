@@ -2,7 +2,7 @@
 // gesture_task.cpp
 //
 // Event-triggered gesture capture with rolling ring buffer, pre-trigger + post-padding,
-// fixed-length resampling to INFERENCE_WINDOW_SIZE, per-window normalization, and
+// fixed-length resampling to INFERENCE_WINDOW_SAMPLES, per-window normalization, and
 // relative-quaternion computation for orientation invariance.
 //
 // Assumptions:
@@ -11,6 +11,7 @@
 //  - FreeRTOS tick rate is 1000 Hz (configTICK_RATE_HZ == 1000).
 //
 
+#define LOG_LOCAL_LEVEL ESP_LOG_WARN
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <esp_timer.h>
@@ -25,7 +26,7 @@
 #include "gesture_task.h"
 
 // Set to 1 to enable raw sensor data logging and validation checks for debugging purposes. Disable for best performance.
-#define DEBUG_SENSOR_DATA 1
+// #define DEBUG_SENSOR_DATA 1
 
 // =========================================================================
 // Task Configuration
@@ -35,7 +36,7 @@ static const char *TAG = "gesture_task";
 #define GESTURE_TASK_PRIORITY 8 // BNO08x driver tasks are pri (5,6,7)
 #define GESTURE_TASK_STACK (12 * 1024)
 
-//_Static_assert(sizeof(GestureSample) * CLASSIFIER_SAMPLES <= GESTURE_TASK_STACK / 2, "normalize_gesture buffers may exceed safe stack usage");
+//_Static_assert(sizeof(GestureSample) * INFERENCE_WINDOW_SAMPLES <= GESTURE_TASK_STACK / 2, "normalize_gesture buffers may exceed safe stack usage");
 _Static_assert(configTICK_RATE_HZ == 1000, "CONFIG_FREERTOS_HZ must be 1000 Hz for accurate vTaskDelayUntil timing");
 
 // =========================================================================
@@ -48,7 +49,7 @@ _Static_assert(configTICK_RATE_HZ == 1000, "CONFIG_FREERTOS_HZ must be 1000 Hz f
 #define SMOOTH_ALPHA 0.15f
 #define STILLNESS_END_MS 300
 #define MIN_GESTURE_MS 750
-#define MAX_GESTURE_MS CLASSIFIER_MS
+#define MAX_GESTURE_MS GESTURE_MS
 
 // -------------------------------------------------------------------------
 // BNO08x instance
@@ -66,7 +67,7 @@ typedef struct
     float qw, qx, qy, qz;
 } RawSample;
 
-#define RING_CAPACITY (INFERENCE_WINDOW_SIZE + 200)
+#define RING_CAPACITY (INFERENCE_WINDOW_SAMPLES + 200)
 static RawSample ring_buffer[RING_CAPACITY];
 static int ring_head = 0;  // next write index
 static int ring_count = 0; // number of valid samples in buffer
@@ -191,13 +192,223 @@ static inline void quat_rotate_vector(float q_w, float q_x, float q_y, float q_z
     *out_z = vpz;
 }
 
+// =========================================================================
+// BNO08x Error Detection and Recovery (Helper Functions)
+// =========================================================================
+
+/**
+ * @brief Configures IMU sensor reports with appropriate data rates.
+ *
+ * Re-enables the required sensors:
+ * - Game Rotation Vector, Linear Accelerometer, Calibrated Gyroscope at SAMPLE_PERIOD_US
+ * - Stability Classifier at SAMPLE_PERIOD_US * 4
+ */
+void set_reports()
+{
+    /*
+        https://cdn.sparkfun.com/assets/2/b/9/0/6/DS-14686-BNO080.pdf
+
+        The maximum available data rates that can be configured per sensor are:
+
+        Composite Sensor            |     Maximum Data rates (Hz)
+        Gyro rotation Vector        |     1000
+        Rotation Vector             |     400
+        Gaming Rotation Vector      |     400
+        Geomagnetic Rotation Vector |     90
+        Gravity                     |     400
+        Linear Acceleration         |     400
+        Accelerometer               |     500
+        Gyroscope                   |     400
+        Magnetometer                |     100
+    */
+    if (!imu.rpt.rv_game.enable(SAMPLE_PERIOD_US))
+        ESP_LOGE(TAG, "Game Rotation Vector: FAILED");
+
+    if (!imu.rpt.linear_accelerometer.enable(SAMPLE_PERIOD_US))
+        ESP_LOGE(TAG, "Linear Accelerometer: FAILED");
+
+    if (!imu.rpt.cal_gyro.enable(SAMPLE_PERIOD_US))
+        ESP_LOGE(TAG, "Calibrated Gyroscope: FAILED");
+
+    if (!imu.rpt.stability_classifier.enable(SAMPLE_PERIOD_US * 4))
+        ESP_LOGE(TAG, "Stability Classifier: FAILED");
+}
+
+/**
+ * @brief Attempt IMU recovery using cascading reset strategy with automatic escalation.
+ * Tracks consecutive soft reset attempts and escalates to hard reset if soft keeps failing.
+ * Escalates: soft (with counter) → hard → init.
+ * @return true if recovery succeeded, false otherwise
+ */
+static bool attempt_imu_recovery()
+{
+    // Track consecutive calls that attempt soft reset
+    // If soft reset is called multiple times without actual recovery (detected by next freeze),
+    // we skip soft and go straight to hard reset
+    static int consecutive_soft_reset_attempts = 0;
+    static constexpr int SOFT_RESET_ATTEMPT_THRESHOLD = 3;
+
+    // Log prior reset reason for diagnostics
+    BNO08xResetReason reason = imu.get_reset_reason();
+    const char *reason_str = "UNKNOWN";
+    switch (reason)
+    {
+    case BNO08xResetReason::UNDEFINED:
+        reason_str = "UNDEFINED";
+        break;
+    case BNO08xResetReason::POR:
+        reason_str = "POR (Power On Reset)";
+        break;
+    case BNO08xResetReason::INT_RST:
+        reason_str = "INT_RST (Internal Reset)";
+        break;
+    case BNO08xResetReason::WTD:
+        reason_str = "WTD (Watchdog Timer)";
+        break;
+    case BNO08xResetReason::EXT_RST:
+        reason_str = "EXT_RST (External Reset)";
+        break;
+    case BNO08xResetReason::OTHER:
+        reason_str = "OTHER";
+        break;
+    }
+    ESP_LOGW(TAG, "Prior reset reason: %s", reason_str);
+
+    // If we've attempted soft reset too many times consecutively, skip it
+    bool skip_soft_reset = (consecutive_soft_reset_attempts >= SOFT_RESET_ATTEMPT_THRESHOLD);
+
+    if (!skip_soft_reset)
+    {
+        // Try soft reset first (faster)
+        if (imu.soft_reset())
+        {
+            ESP_LOGI(TAG, "Soft reset command sent");
+            set_reports();
+            consecutive_soft_reset_attempts++;
+            // Don't return true yet - soft_reset() can succeed but not actually restore data
+            // Let the next freeze detection cycle verify if recovery actually worked
+            // If freeze detected again, we'll increment counter and try again
+            // After SOFT_RESET_ATTEMPT_THRESHOLD attempts, escalate to hard_reset
+            return false;
+        }
+        else
+        {
+            ESP_LOGW(TAG, "Soft reset command failed, attempting hard reset...");
+            consecutive_soft_reset_attempts++; // Count even failed attempts
+        }
+    }
+    else
+    {
+        ESP_LOGW(TAG, "Soft reset attempts failed %d times. Escalating to hard reset...",
+                 consecutive_soft_reset_attempts);
+    }
+
+    // Try hard reset via GPIO
+    if (imu.hard_reset())
+    {
+        ESP_LOGI(TAG, "Hard reset successful");
+        set_reports();
+        consecutive_soft_reset_attempts = 0; // Reset counter on hard reset success
+        return true;
+    }
+
+    // Hard reset failed, fall back to full initialization
+    ESP_LOGE(TAG, "Hard reset failed! Attempting full initialization...");
+    if (imu.initialize())
+    {
+        set_reports();
+        ESP_LOGI(TAG, "Full initialization successful");
+        consecutive_soft_reset_attempts = 0; // Reset counter on init success
+        return true;
+    }
+
+    // All recovery methods failed
+    ESP_LOGE(TAG, "Recovery completely failed!");
+    return false;
+}
+
+/**
+ * @brief Detect HINT/communication loss by checking if has_new_data() returns false.
+ * Monitors for complete communication stall across all reports over consecutive windows.
+ * Attempts recovery if stall is detected.
+ * @return true if any report has new data, false otherwise
+ */
+static bool stall_detection_and_recovery()
+{
+    // Track consecutive windows with zero data from any report
+    static int consecutive_no_data = 0;
+    static constexpr int NO_DATA_THRESHOLD = 2; // Require 2+ windows to confirm stall
+
+    // Check if ANY report has new data this cycle
+    bool any_data = imu.rpt.rv_game.has_new_data() ||
+                    imu.rpt.linear_accelerometer.has_new_data() ||
+                    imu.rpt.cal_gyro.has_new_data();
+
+    if (any_data)
+    {
+        // At least one report has new data - communication OK
+        consecutive_no_data = 0;
+        return true;
+    }
+
+    // No new data from any report - HINT may not be asserting
+    consecutive_no_data++;
+
+    if (consecutive_no_data < NO_DATA_THRESHOLD)
+        return false; // Wait for confirmation across multiple windows
+
+    // Confirmed: No new data for multiple consecutive windows
+    ESP_LOGE(TAG, "HINT communication loss detected! No new data for %d consecutive windows",
+             consecutive_no_data);
+
+    // Attempt recovery (escalation strategy handled internally in attempt_imu_recovery)
+    attempt_imu_recovery();
+    consecutive_no_data = 0;
+
+    return false;
+}
+
+/**
+ * @brief Check calibration status and automatically enable/disable dynamic calibration.
+ * @param game_rv Game rotation vector report containing accuracy information
+ */
+static void check_and_update_calibration(const bno08x_quat_t &game_rv)
+{
+    // Orientation confidence (what you'd use to decide gesture quality)
+    float orientation_uncertainty_radians = game_rv.rad_accuracy;
+    bool confident_reading = (game_rv.rad_accuracy < 0.05f); // < ~3 degrees
+
+    // Calibration status (what you need for "should I calibrate?")
+    // Flag as needing calibration if either accuracy enum is low OR orientation uncertainty is high
+    bool needs_calibration = (game_rv.accuracy == BNO08xAccuracy::LOW ||
+                              game_rv.accuracy == BNO08xAccuracy::UNRELIABLE ||
+                              !confident_reading);
+
+    // Auto-enable/disable dynamic calibration based on current needs
+    static bool calibration_active = false;
+    if (needs_calibration && !calibration_active)
+    {
+        ESP_LOGW(TAG, "Calibration needed: %s, uncertainty: %.3f rad - ENABLING automatic calibration",
+                 BNO08xAccuracy_to_str(game_rv.accuracy), orientation_uncertainty_radians);
+        imu.dynamic_calibration_enable(BNO08xCalSel::all);
+        calibration_active = true;
+    }
+    else if (!needs_calibration && calibration_active)
+    {
+        ESP_LOGI(TAG, "Calibration complete: %s, uncertainty: %.3f rad - DISABLING automatic calibration",
+                 BNO08xAccuracy_to_str(game_rv.accuracy), orientation_uncertainty_radians);
+        imu.dynamic_calibration_disable(BNO08xCalSel::all);
+        calibration_active = false;
+    }
+}
+
 // -------------------------------------------------------------------------
-// normalize_gesture: read samples from ring buffer, resample to INFERENCE_WINDOW_SIZE,
+// normalize_gesture: read samples from ring buffer, resample to INFERENCE_WINDOW_SAMPLES,
 // compute relative quaternion, rotate accel/gyro into start frame (orientation-agnostic),
 // and per-channel normalization.
 // Input: start_idx = ring buffer start index, count = number of samples to read.
-// Output: 'out' array of INFERENCE_WINDOW_SIZE GestureSample entries.
-// Returns INFERENCE_WINDOW_SIZE on success, 0 on failure.
+// Output: 'out' array of INFERENCE_WINDOW_SAMPLES GestureSample entries.
+// Returns INFERENCE_WINDOW_SAMPLES on success, 0 on failure.
 // -------------------------------------------------------------------------
 static int normalize_gesture(int start_idx, int count, GestureSample *out)
 {
@@ -233,7 +444,7 @@ static int normalize_gesture(int start_idx, int count, GestureSample *out)
         return 0;
     }
 
-    int64_t duration = tN - t0;
+    int64_t duration = (int64_t)INFERENCE_WINDOW_MS * 1000; // Use fixed window duration instead of actual captured span
     if (duration == 0)
     {
 #ifdef DEBUG_SENSOR_DATA
@@ -242,21 +453,26 @@ static int normalize_gesture(int start_idx, int count, GestureSample *out)
         return 0;
     }
 
-    // Resample to INFERENCE_WINDOW_SIZE using linear interpolation for accel/gyro
+    // Calculate captured duration to map fixed window into captured time range
+    // This ensures all 800 output samples interpolate within actual captured data
+    int64_t captured_duration = tN - t0;
+
+    // Resample to INFERENCE_WINDOW_SAMPLES using linear interpolation for accel/gyro
     // and quaternion interpolation (shortest-path sign flip + NLERP/SLERP).
     int s = 0; // running source index pointer (improves complexity to O(M+N))
-    for (int i = 0; i < INFERENCE_WINDOW_SIZE; i++)
+    for (int i = 0; i < INFERENCE_WINDOW_SAMPLES; i++)
     {
-        double alpha = (double)i / (double)(INFERENCE_WINDOW_SIZE - 1);
-        int64_t abs_target_ts = t0 + (int64_t)llround(alpha * (double)duration);
-        int64_t rel_ts = abs_target_ts - t0;
-        out[i].timestamp_us = (uint32_t)rel_ts;
+        double alpha = (double)i / (double)(INFERENCE_WINDOW_SAMPLES - 1);
+        // Map fixed output window back into captured time range (unstretch)
+        int64_t captured_target_ts = t0 + (int64_t)llround(alpha * (double)captured_duration);
+        int64_t rel_ts = (int64_t)llround(alpha * (double)duration);
+        out[i].timestamp_ms = (uint32_t)(rel_ts / 1000); // Output timestamp relative to gesture start, in milliseconds
 
-        // Find the bracketing samples
+        // Find the bracketing samples in captured time
         while (s < count - 2)
         {
             RawSample s_next = ring_get_sample_at(start_idx + s + 1);
-            if (s_next.timestamp_us < abs_target_ts)
+            if (s_next.timestamp_us < captured_target_ts)
                 s++;
             else
                 break;
@@ -273,7 +489,7 @@ static int normalize_gesture(int start_idx, int count, GestureSample *out)
         double span = (double)(ts_s1 - ts_s);
         double t = 0.0;
         if (span > 0.0)
-            t = ((double)abs_target_ts - (double)ts_s) / span;
+            t = ((double)captured_target_ts - (double)ts_s) / span;
         if (t < 0.0)
             t = 0.0;
         if (t > 1.0)
@@ -322,7 +538,7 @@ static int normalize_gesture(int start_idx, int count, GestureSample *out)
 
     // Compute relative quaternions q_rel = q * q0^{-1} to remove absolute orientation
     float iw = out[0].qw, ix = -out[0].qx, iy = -out[0].qy, iz = -out[0].qz;
-    for (int i = 0; i < INFERENCE_WINDOW_SIZE; i++)
+    for (int i = 0; i < INFERENCE_WINDOW_SAMPLES; i++)
     {
         float qw = out[i].qw, qx = out[i].qx, qy = out[i].qy, qz = out[i].qz;
         float rw = qw * iw - qx * ix - qy * iy - qz * iz;
@@ -341,7 +557,7 @@ static int normalize_gesture(int start_idx, int count, GestureSample *out)
     // --- NEW: rotate accel and gyro into the start (reference) frame using q_rel ---
     // After this step, accel/gyro are expressed in the same canonical frame (start frame),
     // making the linear/angular signals orientation-agnostic across different initial device poses.
-    for (int i = 0; i < INFERENCE_WINDOW_SIZE; i++)
+    for (int i = 0; i < INFERENCE_WINDOW_SAMPLES; i++)
     {
         float qrw = out[i].qw, qrx = out[i].qx, qry = out[i].qy, qrz = out[i].qz;
 
@@ -368,7 +584,7 @@ static int normalize_gesture(int start_idx, int count, GestureSample *out)
     // training mean/std constants and ensure training uses the same pipeline.
     float mean_ax = 0, mean_ay = 0, mean_az = 0;
     float mean_gx = 0, mean_gy = 0, mean_gz = 0;
-    for (int i = 0; i < INFERENCE_WINDOW_SIZE; i++)
+    for (int i = 0; i < INFERENCE_WINDOW_SAMPLES; i++)
     {
         mean_ax += out[i].ax;
         mean_ay += out[i].ay;
@@ -377,16 +593,16 @@ static int normalize_gesture(int start_idx, int count, GestureSample *out)
         mean_gy += out[i].gy;
         mean_gz += out[i].gz;
     }
-    mean_ax /= (float)INFERENCE_WINDOW_SIZE;
-    mean_ay /= (float)INFERENCE_WINDOW_SIZE;
-    mean_az /= (float)INFERENCE_WINDOW_SIZE;
-    mean_gx /= (float)INFERENCE_WINDOW_SIZE;
-    mean_gy /= (float)INFERENCE_WINDOW_SIZE;
-    mean_gz /= (float)INFERENCE_WINDOW_SIZE;
+    mean_ax /= (float)INFERENCE_WINDOW_SAMPLES;
+    mean_ay /= (float)INFERENCE_WINDOW_SAMPLES;
+    mean_az /= (float)INFERENCE_WINDOW_SAMPLES;
+    mean_gx /= (float)INFERENCE_WINDOW_SAMPLES;
+    mean_gy /= (float)INFERENCE_WINDOW_SAMPLES;
+    mean_gz /= (float)INFERENCE_WINDOW_SAMPLES;
 
     float var_ax = 0, var_ay = 0, var_az = 0;
     float var_gx = 0, var_gy = 0, var_gz = 0;
-    for (int i = 0; i < INFERENCE_WINDOW_SIZE; i++)
+    for (int i = 0; i < INFERENCE_WINDOW_SAMPLES; i++)
     {
         float dax = out[i].ax - mean_ax;
         var_ax += dax * dax;
@@ -403,12 +619,12 @@ static int normalize_gesture(int start_idx, int count, GestureSample *out)
     }
 
     // Population standard deviation (consistent with original code)
-    var_ax = sqrtf(var_ax / (float)INFERENCE_WINDOW_SIZE);
-    var_ay = sqrtf(var_ay / (float)INFERENCE_WINDOW_SIZE);
-    var_az = sqrtf(var_az / (float)INFERENCE_WINDOW_SIZE);
-    var_gx = sqrtf(var_gx / (float)INFERENCE_WINDOW_SIZE);
-    var_gy = sqrtf(var_gy / (float)INFERENCE_WINDOW_SIZE);
-    var_gz = sqrtf(var_gz / (float)INFERENCE_WINDOW_SIZE);
+    var_ax = sqrtf(var_ax / (float)INFERENCE_WINDOW_SAMPLES);
+    var_ay = sqrtf(var_ay / (float)INFERENCE_WINDOW_SAMPLES);
+    var_az = sqrtf(var_az / (float)INFERENCE_WINDOW_SAMPLES);
+    var_gx = sqrtf(var_gx / (float)INFERENCE_WINDOW_SAMPLES);
+    var_gy = sqrtf(var_gy / (float)INFERENCE_WINDOW_SAMPLES);
+    var_gz = sqrtf(var_gz / (float)INFERENCE_WINDOW_SAMPLES);
 
     const float MIN_STD = 1e-3f;
     if (var_ax < MIN_STD)
@@ -424,7 +640,7 @@ static int normalize_gesture(int start_idx, int count, GestureSample *out)
     if (var_gz < MIN_STD)
         var_gz = MIN_STD;
 
-    for (int i = 0; i < INFERENCE_WINDOW_SIZE; i++)
+    for (int i = 0; i < INFERENCE_WINDOW_SAMPLES; i++)
     {
         out[i].ax = (out[i].ax - mean_ax) / var_ax;
         out[i].ay = (out[i].ay - mean_ay) / var_ay;
@@ -439,7 +655,7 @@ static int normalize_gesture(int start_idx, int count, GestureSample *out)
     ESP_LOGD(TAG, "normalize_gesture SUCCESS: processed %d samples over duration %" PRId64 " µs", count, duration);
 #endif
 
-    return INFERENCE_WINDOW_SIZE;
+    return INFERENCE_WINDOW_SAMPLES;
 }
 
 // -------------------------------------------------------------------------
@@ -461,7 +677,7 @@ enum class GestureState
 // -------------------------------------------------------------------------
 static void gesture_task(void *arg)
 {
-    ESP_LOGI(TAG, "Entering gesture_task (window=%d samples, %d ms at %d Hz)", INFERENCE_WINDOW_SIZE, CLASSIFIER_MS, IMU_RATE_HZ);
+    ESP_LOGI(TAG, "Entering gesture_task (window=%d milliseconds, %d ms at %d Hz)", INFERENCE_WINDOW_SAMPLES, INFERENCE_WINDOW_MS, IMU_RATE_HZ);
 
     GestureState state = GestureState::IDLE;
     int64_t gesture_start_ts = 0;
@@ -507,13 +723,12 @@ static void gesture_task(void *arg)
         int64_t window_elapsed = now - freq_window_start;
         if (window_elapsed >= 1000000) // ~1 second in microseconds
         {
-            float elapsed_s = window_elapsed / 1000000.0f;
-            float rv_freq = rv_update_count / elapsed_s;
-            float la_freq = la_update_count / elapsed_s;
-            float cg_freq = cg_update_count / elapsed_s;
-            float sc_freq = sc_update_count / elapsed_s;
-            ESP_LOGI(TAG, "Actual update frequency (%.2f s) - RV: %.1f Hz | LA: %.1f Hz | CG: %.1f Hz | SC: %.1f Hz",
-                     elapsed_s, rv_freq, la_freq, cg_freq, sc_freq);
+            int rv_freq = (rv_update_count * 1000000) / window_elapsed;
+            int la_freq = (la_update_count * 1000000) / window_elapsed;
+            int cg_freq = (cg_update_count * 1000000) / window_elapsed;
+            int sc_freq = (sc_update_count * 1000000) / window_elapsed;
+            ESP_LOGI(TAG, "Actual update frequency (%.2f s) - RV: %d Hz | LA: %d Hz | CG: %d Hz | SC: %d Hz",
+                     window_elapsed / 1000000.0f, rv_freq, la_freq, cg_freq, sc_freq);
 
             // Reset counters
             freq_window_start = now;
@@ -523,6 +738,11 @@ static void gesture_task(void *arg)
             sc_update_count = 0;
             sample_count = 0;
         }
+#else
+        // Check for communication loss via has_new_data() stall detection and attempt recovery if needed
+        // Only do this when we are not tracking frequency tracking as the call to
+        // has_new_data() resets the internal "new data" flag.
+        stall_detection_and_recovery();
 #endif // DEBUG_SENSOR_DATA
 
         // Always read reports, even if some are stale
@@ -530,10 +750,28 @@ static void gesture_task(void *arg)
         bno08x_quat_t game_rv = imu.rpt.rv_game.get_quat();
         bno08x_accel_t lin_accel = imu.rpt.linear_accelerometer.get();
         bno08x_gyro_t gyro = imu.rpt.cal_gyro.get();
-        bno08x_stability_classifier_t stability = imu.rpt.stability_classifier.get();
 
-        // Validate data bounds to catch sensor errors/glitches
+        RawSample s;
+        s.timestamp_us = now;
+        s.ax = lin_accel.x;
+        s.ay = lin_accel.y;
+        s.az = lin_accel.z;
+        s.gx = gyro.x;
+        s.gy = gyro.y;
+        s.gz = gyro.z;
+        s.qw = game_rv.real;
+        s.qx = game_rv.i;
+        s.qy = game_rv.j;
+        s.qz = game_rv.k;
+
+        // Push into ring buffer
+        ring_push_sample(&s);
+
+        // Check and update calibration status
+        check_and_update_calibration(game_rv);
+
 #ifdef DEBUG_SENSOR_DATA
+        // Validate data bounds to catch sensor errors/glitches
         const float ACCEL_MAX = 30.0f; // m/s² (typical air gesture ~5-30 m/s², impacts >50 m/s²)
         const float GYRO_MAX = 500.0f; // deg/s
         const float QUAT_MIN = 0.9f;   // Unit quaternion magnitude should be ~1.0
@@ -562,24 +800,10 @@ static void gesture_task(void *arg)
         }
 #endif // DEBUG_SENSOR_DATA
 
-        RawSample s;
-        s.timestamp_us = now;
-        s.ax = lin_accel.x;
-        s.ay = lin_accel.y;
-        s.az = lin_accel.z;
-        s.gx = gyro.x;
-        s.gy = gyro.y;
-        s.gz = gyro.z;
-        s.qw = game_rv.real;
-        s.qx = game_rv.i;
-        s.qy = game_rv.j;
-        s.qz = game_rv.k;
-
-        // Push into ring buffer
-        ring_push_sample(&s);
-
         // log stability classifier changes (I intend to use this to do power management in the future, but for now it’s just informational)
+#ifdef POWER_MANAGEMENT
         static BNO08xStability last_stability = BNO08xStability::UNDEFINED;
+        bno08x_stability_classifier_t stability = imu.rpt.stability_classifier.get();
         if (stability.stability != last_stability)
         {
             const char *stability_str;
@@ -609,6 +833,7 @@ static void gesture_task(void *arg)
             ESP_LOGI(TAG, "Stability changed to: %s", stability_str);
             last_stability = stability.stability;
         }
+#endif // POWER_MANAGEMENT
 
         // ------------------------------------------
         // Detect when we start to cast a spell
@@ -617,7 +842,7 @@ static void gesture_task(void *arg)
         // Compute motion energy from linear acceleration magnitude (sensor frame)
         float accel_mag = sqrtf(s.ax * s.ax + s.ay * s.ay + s.az * s.az);
 #ifdef DEBUG_SENSOR_DATA
-        if (accel_mag > 30.0)
+        if (accel_mag > 50.0)
         {
             ESP_LOGW(TAG, "High accel magnitude: %.3f m/s²", accel_mag);
         }
@@ -704,40 +929,14 @@ static void gesture_task(void *arg)
 
                 // cap our sample count to the max that normalize_gesture can handle as we may get a few more since our logic is time based not sample-based
                 int total_samples = PRE_TRIGGER_SAMPLES + samples_since_trigger;
-                if (total_samples > INFERENCE_WINDOW_SIZE)
-                    total_samples = INFERENCE_WINDOW_SIZE;
+                if (total_samples > INFERENCE_WINDOW_SAMPLES)
+                    total_samples = INFERENCE_WINDOW_SAMPLES;
 
-                // static so we doesn't exceed stack usage
-                static GestureSample norm[INFERENCE_WINDOW_SIZE];
+                // static so we don't exceed stack usage
+                static GestureSample norm[INFERENCE_WINDOW_SAMPLES];
                 int n = normalize_gesture(start_idx, total_samples, norm);
-                if (n == INFERENCE_WINDOW_SIZE)
+                if (n == INFERENCE_WINDOW_SAMPLES)
                 {
-                    // Send start-of gesture marker (timestamp_us = 0, ax = NAN)
-                    GestureSample marker;
-                    marker.timestamp_us = 0;
-                    marker.ax = NAN;
-                    marker.ay = NAN;
-                    marker.az = NAN;
-                    marker.gx = NAN;
-                    marker.gy = NAN;
-                    marker.gz = NAN;
-                    marker.qw = NAN;
-                    marker.qx = NAN;
-                    marker.qy = NAN;
-                    marker.qz = NAN;
-                    if (xQueueSend(g_fusion_queue, &marker, 0) != pdTRUE)
-                    {
-                        vTaskDelay(pdMS_TO_TICKS(10));
-                        if (xQueueSend(g_fusion_queue, &marker, 0) != pdTRUE)
-                        {
-                            ESP_LOGW(TAG, "fusion_queue full, dropping gesture");
-                            ESP_LOGI(TAG, "Transition to IDLE");
-                            state = GestureState::IDLE;
-                            smoothed_motion_energy = 0.0f; // reset filter to avoid immediately retriggering on residual motion
-                            continue;
-                        }
-                    }
-
                     // Send normalized gesture samples
                     for (int i = 0; i < n; i++)
                     {
@@ -781,36 +980,12 @@ void gesture_task_start(void)
         return;
     }
 
-    // Disable all reports first then re-enable desired reports with correct rates.
+    // Enable dynamic calibration autosave - calibration persists in device's internal flash
+    imu.dynamic_calibration_autosave_enable();
+
+    // set desired reports and rates
     imu.disable_all_reports();
-
-    /*
-        https://cdn.sparkfun.com/assets/2/b/9/0/6/DS-14686-BNO080.pdf
-
-        The maximum available data rates that can be configured per sensor are:
-
-        Composite Sensor            |     Maximum Data rates (Hz)
-        Gyro rotation Vector        |     1000
-        Rotation Vector             |     400
-        Gaming Rotation Vector      |     400
-        Geomagnetic Rotation Vector |     90
-        Gravity                     |     400
-        Linear Acceleration         |     400
-        Accelerometer               |     500
-        Gyroscope                   |     400
-        Magnetometer                |     100
-    */
-    if (!imu.rpt.rv_game.enable(SAMPLE_PERIOD_US))
-        ESP_LOGE(TAG, "Game Rotation Vector: FAILED");
-
-    if (!imu.rpt.linear_accelerometer.enable(SAMPLE_PERIOD_US))
-        ESP_LOGE(TAG, "Linear Accelerometer: FAILED");
-
-    if (!imu.rpt.cal_gyro.enable(SAMPLE_PERIOD_US))
-        ESP_LOGE(TAG, "Calibrated Gyroscope: FAILED");
-
-    if (!imu.rpt.stability_classifier.enable(SAMPLE_PERIOD_US * 4))
-        ESP_LOGE(TAG, "Stability Classifier: FAILED");
+    set_reports();
 
     // Start gesture processing task
     xTaskCreatePinnedToCore(

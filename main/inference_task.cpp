@@ -60,10 +60,10 @@ static void tflm_init(void)
     input_tensor = interpreter->input(0);
 
     configASSERT(input_tensor->dims->size == 3);
-    configASSERT(input_tensor->dims->data[1] == INFERENCE_WINDOW_SIZE);
+    configASSERT(input_tensor->dims->data[1] == INFERENCE_WINDOW_SAMPLES);
     configASSERT(input_tensor->dims->data[2] == FEATURE_COUNT);
 
-    ESP_LOGI(TAG, "TFLM ready: input [%d x %d]", INFERENCE_WINDOW_SIZE, FEATURE_COUNT);
+    ESP_LOGI(TAG, "TFLM ready: input [%d x %d]", INFERENCE_WINDOW_SAMPLES, FEATURE_COUNT);
 }
 
 // ---------------------------------------------------------
@@ -103,7 +103,7 @@ static GestureType decode_output(float *out_confidence)
 // ---------------------------------------------------------
 static void inference_task(void *arg)
 {
-    GestureSample gesture[INFERENCE_WINDOW_SIZE];
+    GestureSample gesture[INFERENCE_WINDOW_SAMPLES];
     int count = 0;
 
     ESP_LOGI(TAG, "Entering inference_task");
@@ -118,7 +118,7 @@ static void inference_task(void *arg)
         count = 0;
 
         // Now collect the gesture
-        while (count < INFERENCE_WINDOW_SIZE)
+        while (count < INFERENCE_WINDOW_SAMPLES)
         {
             if (xQueueReceive(g_fusion_queue, &gesture[count], 0) != pdTRUE)
                 break;
@@ -144,7 +144,7 @@ static void inference_task(void *arg)
         if (g != GESTURE_NONE)
         {
             GestureEvent ev = {
-                .timestamp_us = gesture[0].timestamp_us,
+//                .timestamp_us = gesture[0].timestamp_us,
                 .gesture = g};
             xQueueSend(g_gesture_queue, &ev, 0);
 

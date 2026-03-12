@@ -224,9 +224,10 @@ static void ha_send_gesture(const GestureEvent *ev)
     const char *name = gesture_to_string(ev->gesture);
 
     char payload[128];
-    snprintf(payload, sizeof(payload),
-             "{\"gesture\":\"%s\",\"timestamp\":%" PRIu64 "}",
-             name, ev->timestamp_us);
+    // snprintf(payload, sizeof(payload),
+    //          "{\"gesture\":\"%s\",\"timestamp\":%" PRIu64 "}",
+    //          name, ev->timestamp_us);
+    snprintf(payload, sizeof(payload), "{\"gesture\":\"%s\"}", name);
 
     esp_mqtt_client_publish(
         mqtt_client,

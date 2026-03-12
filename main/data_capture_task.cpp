@@ -1,3 +1,4 @@
+#define LOG_LOCAL_LEVEL ESP_LOG_WARN
 #include "data_capture_task.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -30,8 +31,13 @@ static void capture_task(void *arg)
     {
         if (xQueueReceive(g_fusion_queue, &g, portMAX_DELAY) == pdTRUE)
         {
+            if (g.timestamp_ms == 0)
+            {
+                ESP_LOGI(TAG, "New gesture capture started");
+                printf("timestamp_ms,ax,ay,az,gx,gy,gz,qw,qx,qy,qz\n"); // CSV header
+            }
             printf("%" PRIu32 ",%f,%f,%f,%f,%f,%f,%f,%f,%f,%f\n",
-                   g.timestamp_us,          // timestamp is relative to gesture start (first sample has timestamp 0)
+                   g.timestamp_ms,          // timestamp is relative to gesture start (first sample has timestamp 0)
                    g.ax, g.ay, g.az,        // ax, ay, az are linear acceleration (sensor frame, gravity removed by BNO08x), m/s^2
                    g.gx, g.gy, g.gz,        // gx, gy, gz are gyroscope (sensor frame, calibrated by BNO08x), rad/s
                    g.qw, g.qx, g.qy, g.qz); // qw, qx, qy, qz are the fused game rotation vector quaternion components (game rotation vector / fused orientation)
