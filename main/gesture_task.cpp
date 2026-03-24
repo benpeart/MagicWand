@@ -27,6 +27,7 @@
 
 // Set to 1 to enable raw sensor data logging and validation checks for debugging purposes. Disable for best performance.
 // #define DEBUG_SENSOR_DATA 1
+#define IMU_RECOVERY 1
 
 // =========================================================================
 // Task Configuration
@@ -234,103 +235,159 @@ void set_reports()
         ESP_LOGE(TAG, "Stability Classifier: FAILED");
 }
 
+// =========================================================================
+// IMU Recovery State Machine (persists across calls)
+// =========================================================================
+#ifdef IMU_RECOVERY
+
 /**
- * @brief Attempt IMU recovery using cascading reset strategy with automatic escalation.
- * Tracks consecutive soft reset attempts and escalates to hard reset if soft keeps failing.
- * Escalates: soft (with counter) → hard → init.
- * @return true if recovery succeeded, false otherwise
+ * @brief Recovery stage enumeration for cascading reset strategy.
+ */
+enum class RecoveryStage
+{
+    SOFT_RESET, // Stage 1: software reset (3 attempts)
+    HARD_RESET, // Stage 2: hardware reset via GPIO (3 attempts)
+    EXHAUSTED   // All recovery attempts failed
+};
+
+static RecoveryStage recovery_stage = RecoveryStage::SOFT_RESET;
+static int recovery_attempts_in_stage = 0;
+static constexpr int RECOVERY_MAX_ATTEMPTS_PER_STAGE = 3;
+
+/**
+ * @brief Reset IMU recovery state machine to initial state.
+ * Called when communication resumes to prepare state machine for fresh attempts if needed.
+ */
+static void reset_imu_recovery_state()
+{
+    recovery_stage = RecoveryStage::SOFT_RESET;
+    recovery_attempts_in_stage = 0;
+    ESP_LOGI(TAG, "Recovery state machine reset to SOFT_RESET (data flow resumed)");
+}
+
+/**
+ * @brief Attempt IMU recovery using cascading reset strategy state machine.
+ *
+ * Each stage gets up to 3 attempts before escalating to the next stage.
+ * Cascade: SOFT_RESET (3x) → HARD_RESET (3x) → EXHAUSTED
+ *
+ * NOTE: This function does NOT claim success. The return value only indicates
+ * whether we're still attempting recovery or have exhausted all attempts.
+ * ACTUAL success is determined by checking if data flow resumes.
+ * The recovery state machine will be reset when data is detected.
+ *
+ * @return true if recovery attempts exhausted (complete failure), false if still attempting
  */
 static bool attempt_imu_recovery()
 {
-    // Track consecutive calls that attempt soft reset
-    // If soft reset is called multiple times without actual recovery (detected by next freeze),
-    // we skip soft and go straight to hard reset
-    static int consecutive_soft_reset_attempts = 0;
-    static constexpr int SOFT_RESET_ATTEMPT_THRESHOLD = 3;
+    // Nothing I've tried helps (soft reset, hard reset, reconfiguring reports, etc).
+    // Just restart to attempt recovery from a clean slate. Even this only works sometimes.
+    ESP_LOGE(TAG, "Recovery already exhausted. Restarting system...");
+    esp_restart();
 
-    // Log prior reset reason for diagnostics
-    BNO08xResetReason reason = imu.get_reset_reason();
-    const char *reason_str = "UNKNOWN";
-    switch (reason)
+#ifdef NEVER
+        // Log prior reset reason for diagnostics (first attempt only per recovery session)
+    if (recovery_attempts_in_stage == 0)
     {
-    case BNO08xResetReason::UNDEFINED:
-        reason_str = "UNDEFINED";
-        break;
-    case BNO08xResetReason::POR:
-        reason_str = "POR (Power On Reset)";
-        break;
-    case BNO08xResetReason::INT_RST:
-        reason_str = "INT_RST (Internal Reset)";
-        break;
-    case BNO08xResetReason::WTD:
-        reason_str = "WTD (Watchdog Timer)";
-        break;
-    case BNO08xResetReason::EXT_RST:
-        reason_str = "EXT_RST (External Reset)";
-        break;
-    case BNO08xResetReason::OTHER:
-        reason_str = "OTHER";
-        break;
-    }
-    ESP_LOGW(TAG, "Prior reset reason: %s", reason_str);
-
-    // If we've attempted soft reset too many times consecutively, skip it
-    bool skip_soft_reset = (consecutive_soft_reset_attempts >= SOFT_RESET_ATTEMPT_THRESHOLD);
-
-    if (!skip_soft_reset)
-    {
-        // Try soft reset first (faster)
-        if (imu.soft_reset())
+        BNO08xResetReason reason = imu.get_reset_reason();
+        const char *reason_str = "UNKNOWN";
+        switch (reason)
         {
-            ESP_LOGI(TAG, "Soft reset command sent");
-            set_reports();
-            consecutive_soft_reset_attempts++;
-            // Don't return true yet - soft_reset() can succeed but not actually restore data
-            // Let the next freeze detection cycle verify if recovery actually worked
-            // If freeze detected again, we'll increment counter and try again
-            // After SOFT_RESET_ATTEMPT_THRESHOLD attempts, escalate to hard_reset
-            return false;
+        case BNO08xResetReason::UNDEFINED:
+            reason_str = "UNDEFINED";
+            break;
+        case BNO08xResetReason::POR:
+            reason_str = "POR (Power On Reset)";
+            break;
+        case BNO08xResetReason::INT_RST:
+            reason_str = "INT_RST (Internal Reset)";
+            break;
+        case BNO08xResetReason::WTD:
+            reason_str = "WTD (Watchdog Timer)";
+            break;
+        case BNO08xResetReason::EXT_RST:
+            reason_str = "EXT_RST (External Reset)";
+            break;
+        case BNO08xResetReason::OTHER:
+            reason_str = "OTHER";
+            break;
         }
-        else
+        ESP_LOGW(TAG, "Recovery initiated - Prior reset reason: %s", reason_str);
+    }
+
+    // Execute current recovery stage
+    switch (recovery_stage)
+    {
+    // -----------------------------------------------
+    // Stage 1: Soft reset (fastest recovery method)
+    // -----------------------------------------------
+    case RecoveryStage::SOFT_RESET:
+    {
+        recovery_attempts_in_stage++;
+        ESP_LOGI(TAG, "Attempting soft reset (%d/%d)...", recovery_attempts_in_stage, RECOVERY_MAX_ATTEMPTS_PER_STAGE);
+
+        // Attempt soft reset, but DO NOT trust the return value as true success.
+        // Only the resumption of actual data flow proves this worked.
+        imu.soft_reset();
+        set_reports();
+        // Log attempt but don't assume success
+        ESP_LOGW(TAG, "Soft reset attempt sent (true recovery verified only on data resumption)");
+
+        // Check if we've exhausted attempts in this stage
+        if (recovery_attempts_in_stage >= RECOVERY_MAX_ATTEMPTS_PER_STAGE)
         {
-            ESP_LOGW(TAG, "Soft reset command failed, attempting hard reset...");
-            consecutive_soft_reset_attempts++; // Count even failed attempts
+            ESP_LOGW(TAG, "Soft reset exhausted (%d attempts). Escalating to hard reset...", RECOVERY_MAX_ATTEMPTS_PER_STAGE);
+            recovery_stage = RecoveryStage::HARD_RESET;
+            recovery_attempts_in_stage = 0;
         }
-    }
-    else
-    {
-        ESP_LOGW(TAG, "Soft reset attempts failed %d times. Escalating to hard reset...",
-                 consecutive_soft_reset_attempts);
+        return false; // Recovery attempt made, keep monitoring for data
     }
 
-    // Try hard reset via GPIO
-    if (imu.hard_reset())
+    // -----------------------------------------------
+    // Stage 2: Hard reset via GPIO
+    // -----------------------------------------------
+    case RecoveryStage::HARD_RESET:
     {
-        ESP_LOGI(TAG, "Hard reset successful");
+        recovery_attempts_in_stage++;
+        ESP_LOGI(TAG, "Attempting hard reset (%d/%d)...", recovery_attempts_in_stage, RECOVERY_MAX_ATTEMPTS_PER_STAGE);
+
+        // Attempt hard reset, but DO NOT trust the return value as true success.
+        imu.hard_reset();
         set_reports();
-        consecutive_soft_reset_attempts = 0; // Reset counter on hard reset success
-        return true;
+        ESP_LOGW(TAG, "Hard reset attempt sent (true recovery verified only on data resumption)");
+
+        // Check if we've exhausted attempts in this stage
+        if (recovery_attempts_in_stage >= RECOVERY_MAX_ATTEMPTS_PER_STAGE)
+        {
+            ESP_LOGE(TAG, "All recovery stages exhausted! (%d soft + %d hard attempts). Recovery completely failed.",
+                     RECOVERY_MAX_ATTEMPTS_PER_STAGE,
+                     RECOVERY_MAX_ATTEMPTS_PER_STAGE);
+            recovery_stage = RecoveryStage::EXHAUSTED;
+            recovery_attempts_in_stage = 0;
+            return true; // Signal: all recovery attempts exhausted
+        }
+        return false; // Recovery attempt made, keep monitoring for data
     }
 
-    // Hard reset failed, fall back to full initialization
-    ESP_LOGE(TAG, "Hard reset failed! Attempting full initialization...");
-    if (imu.initialize())
+    // -----------------------------------------------
+    // Stage 3: Exhausted - all recovery attempts failed
+    // -----------------------------------------------
+    case RecoveryStage::EXHAUSTED:
     {
-        set_reports();
-        ESP_LOGI(TAG, "Full initialization successful");
-        consecutive_soft_reset_attempts = 0; // Reset counter on init success
-        return true;
+        // We are already in exhausted state, so just restart to attempt recovery from a clean slate.
+        ESP_LOGE(TAG, "Recovery already exhausted. Restarting system...");
+        esp_restart();
+        return true; // Signal: all recovery attempts exhausted
     }
-
-    // All recovery methods failed
-    ESP_LOGE(TAG, "Recovery completely failed!");
-    return false;
+    }
+#endif // NEVER
+    return false; // Should not reach here
 }
 
 /**
  * @brief Detect HINT/communication loss by checking if has_new_data() returns false.
  * Monitors for complete communication stall across all reports over consecutive windows.
- * Attempts recovery if stall is detected.
+ * Attempts recovery if stall is detected. Resets recovery state when data resumes.
  * @return true if any report has new data, false otherwise
  */
 static bool stall_detection_and_recovery()
@@ -347,6 +404,11 @@ static bool stall_detection_and_recovery()
     if (any_data)
     {
         // At least one report has new data - communication OK
+        if (consecutive_no_data > 0)
+        {
+            // Data has resumed after stall - reset recovery state machine
+            reset_imu_recovery_state();
+        }
         consecutive_no_data = 0;
         return true;
     }
@@ -358,15 +420,18 @@ static bool stall_detection_and_recovery()
         return false; // Wait for confirmation across multiple windows
 
     // Confirmed: No new data for multiple consecutive windows
-    ESP_LOGE(TAG, "HINT communication loss detected! No new data for %d consecutive windows",
-             consecutive_no_data);
-
-    // Attempt recovery (escalation strategy handled internally in attempt_imu_recovery)
+    ESP_LOGE(TAG, "HINT communication loss detected! No new data for %d consecutive windows", consecutive_no_data);
     attempt_imu_recovery();
-    consecutive_no_data = 0;
+
+    // Do NOT reset consecutive_no_data after exhaustion so we don't keep re-triggering recovery
+    if (recovery_stage != RecoveryStage::EXHAUSTED)
+    {
+        consecutive_no_data = 0;
+    }
 
     return false;
 }
+#endif // IMU_RECOVERY
 
 /**
  * @brief Check calibration status and automatically enable/disable dynamic calibration.
@@ -739,10 +804,12 @@ static void gesture_task(void *arg)
             sample_count = 0;
         }
 #else
+#ifdef IMU_RECOVERY
         // Check for communication loss via has_new_data() stall detection and attempt recovery if needed
         // Only do this when we are not tracking frequency tracking as the call to
         // has_new_data() resets the internal "new data" flag.
         stall_detection_and_recovery();
+#endif // IMU_RECOVERY
 #endif // DEBUG_SENSOR_DATA
 
         // Always read reports, even if some are stale
@@ -801,36 +868,12 @@ static void gesture_task(void *arg)
 #endif // DEBUG_SENSOR_DATA
 
         // log stability classifier changes (I intend to use this to do power management in the future, but for now it’s just informational)
-#ifdef POWER_MANAGEMENT
+#ifndef POWER_MANAGEMENT
         static BNO08xStability last_stability = BNO08xStability::UNDEFINED;
         bno08x_stability_classifier_t stability = imu.rpt.stability_classifier.get();
         if (stability.stability != last_stability)
         {
-            const char *stability_str;
-            switch (stability.stability)
-            {
-            case BNO08xStability::UNKNOWN:
-                stability_str = "UNKNOWN";
-                break;
-            case BNO08xStability::ON_TABLE:
-                stability_str = "ON_TABLE";
-                break;
-            case BNO08xStability::STATIONARY:
-                stability_str = "STATIONARY";
-                break;
-            case BNO08xStability::STABLE:
-                stability_str = "STABLE";
-                break;
-            case BNO08xStability::MOTION:
-                stability_str = "MOTION";
-                break;
-            case BNO08xStability::RESERVED:
-                stability_str = "RESERVED";
-                break;
-            default:
-                stability_str = "UNDEFINED";
-            }
-            ESP_LOGI(TAG, "Stability changed to: %s", stability_str);
+            ESP_LOGI(TAG, "Stability changed to: %s", BNO08xStability_to_str(stability.stability));
             last_stability = stability.stability;
         }
 #endif // POWER_MANAGEMENT
@@ -927,7 +970,8 @@ static void gesture_task(void *arg)
                 if (start_idx < 0)
                     start_idx += RING_CAPACITY;
 
-                // cap our sample count to the max that normalize_gesture can handle as we may get a few more since our logic is time based not sample-based
+                // cap our sample count to the max that normalize_gesture can handle
+                // as we may get a few more since our logic is time based not sample-based
                 int total_samples = PRE_TRIGGER_SAMPLES + samples_since_trigger;
                 if (total_samples > INFERENCE_WINDOW_SAMPLES)
                     total_samples = INFERENCE_WINDOW_SAMPLES;
@@ -974,6 +1018,7 @@ static void gesture_task(void *arg)
 void gesture_task_start(void)
 {
     ESP_LOGI(TAG, "Initializing BNO08x IMU...");
+
     if (!imu.initialize())
     {
         ESP_LOGE(TAG, "BNO08x initialization failed!");
