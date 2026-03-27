@@ -1,5 +1,5 @@
 #define LOG_LOCAL_LEVEL ESP_LOG_WARN
-#include "data_capture_task.h"
+#include "serial_capture_task.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "queues.h"
@@ -16,16 +16,16 @@
 // -----------------------------
 // Task Configuration
 // -----------------------------
-static const char *TAG = "data_capture_task";
+static const char *TAG = "serial_capture_task";
 #define CAPTURE_TASK_CORE 1
 #define CAPTURE_TASK_PRIORITY 4
 #define CAPTURE_TASK_STACK (4 * 1024)
 
-static void capture_task(void *arg)
+static void serial_capture_task(void *arg)
 {
     GestureSample g;
 
-    ESP_LOGI(TAG, "Entering capture_task");
+    ESP_LOGI(TAG, "Entering serial_capture_task");
 
     for (;;)
     {
@@ -45,10 +45,10 @@ static void capture_task(void *arg)
     }
 }
 
-void capture_task_start(void)
+void serial_capture_task_start(void)
 {
     xTaskCreatePinnedToCore(
-        capture_task,
+        serial_capture_task,
         TAG,
         CAPTURE_TASK_STACK,
         NULL,

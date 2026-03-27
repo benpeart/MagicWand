@@ -6,7 +6,8 @@
 #include "gesture_task.h"
 #include "inference_task.h"
 #include "ha_task.h"
-#include "data_capture_task.h"
+#include "serial_capture_task.h"
+#include "wifi_capture_task.h"
 
 static const char *TAG = "main";
 
@@ -18,7 +19,8 @@ extern "C" void app_main(void)
 
     gesture_task_start();
 #if 1
-    capture_task_start();
+    wifi_capture_task_start();
+//    serial_capture_task_start();
 #else
     inference_task_start();
     ha_task_start();

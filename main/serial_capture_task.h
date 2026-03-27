@@ -24,4 +24,4 @@
  *   the visualizer and the inference engine, ensuring consistency across
  *   debugging, training, and real‑time recognition.
  * -------------------------------------------------------------------------- */
-void capture_task_start(void);
+void serial_capture_task_start(void);
