@@ -18,9 +18,18 @@ import time
 from pathlib import Path
 from typing import List, Optional, Tuple
 
+import matplotlib.pyplot as plt
+import numpy as np
+
 BASE_DIR = Path("data/raw")
 SOCKET_TIMEOUT = 5.0  # Timeout for reading individual lines
 SAMPLES_PER_GESTURE = 801  # Must match INFERENCE_WINDOW_SAMPLES from data_types.h
+
+# Enable interactive plotting mode
+plt.ion()
+
+# Global figure for gesture plotting
+gesture_figure = None
 
 
 def normalize_subject(subject_input: str) -> str:
@@ -170,6 +179,59 @@ def receive_gesture(sock: socket.socket) -> Tuple[Optional[str], List[str]]:
         return None, []
 
 
+def plot_gesture(header: str, samples: List[str]) -> None:
+    """
+    Plot gesture data as a line graph with labeled axes and color coding.
+    Each column from the header is plotted as a separate line.
+    Reuses the same figure window across all gestures.
+    """
+    global gesture_figure
+    
+    try:
+        # Parse header to get column names
+        columns = [col.strip() for col in header.split(',')]
+        
+        # Parse sample data
+        data = []
+        for sample in samples:
+            values = [float(val.strip()) for val in sample.split(',')]
+            data.append(values)
+        
+        # Convert to numpy array for easier manipulation
+        data_array = np.array(data)
+        
+        # Create figure if it doesn't exist
+        if gesture_figure is None:
+            gesture_figure = plt.figure(figsize=(12, 6))
+        
+        # Clear the existing figure
+        gesture_figure.clear()
+        ax = gesture_figure.add_subplot(111)
+        
+        # Define a color palette for different columns
+        colors = plt.cm.tab10(np.linspace(0, 1, len(columns)))
+        
+        # Plot each column as a line (skip timestamp_ms)
+        for i, col_name in enumerate(columns):
+            if col_name.lower() != 'timestamp_ms':
+                ax.plot(data_array[:, i], label=col_name, color=colors[i], linewidth=1.5, alpha=0.8)
+        
+        # Add labels and formatting
+        ax.set_xlabel('Sample Index', fontsize=12, fontweight='bold')
+        ax.set_ylabel('Value', fontsize=12, fontweight='bold')
+        ax.set_title(f'Gesture Capture - {SAMPLES_PER_GESTURE} Samples', fontsize=14, fontweight='bold')
+        ax.legend(loc='upper right', fontsize=10)
+        ax.grid(True, alpha=0.3)
+        
+        gesture_figure.tight_layout()
+        
+        # Update display without stealing focus
+        gesture_figure.canvas.flush_events()
+        
+    except Exception as e:
+        print(f"Error plotting gesture: {e}")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Receive gesture data from WiFi capture task"
@@ -233,6 +295,10 @@ def main():
                     print(f"  [{i+1}] {samples[i]}")
                 if len(samples) > preview_n:
                     print(f"  ... ({len(samples) - preview_n} more samples)")
+
+                # Plot the gesture
+                print("\nGenerating graph...")
+                plot_gesture(header, samples)
 
                 save = prompt_yes_no("Save this gesture? (yes/no):")
                 if save:
